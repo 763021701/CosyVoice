@@ -1,12 +1,18 @@
 #!/usr/bin/env python3
 """
-医患对话语音数据合成工具
+医疗场景对话语音数据合成工具
 
 用途：
-- 读取医患对话文本文件（格式：[医生/患者] 说话内容）
-- 随机分配两个不同音色作为医生和患者
+- 读取对话文本文件（格式：[角色] 说话内容）
+- 自动识别对话中的角色并分配不同音色
 - 使用 CosyVoice 合成每句对话
 - 支持多进程并行、断点续传
+
+支持的场景：
+1. 门诊对话：医生、患者
+2. 手术记录：主刀医生、麻醉医生、器械护士、一助医生
+3. 查房问诊：主治医生、患者、住院医生（可选）、实习生（可选）
+4. 其他场景：自动识别 [角色名] 格式的任意角色
 
 示例用法：
     # 单进程合成
@@ -37,17 +43,143 @@ import torch
 import torchaudio
 
 
+# 角色名称标准化映射表
+# 支持多种称呼方式映射到统一的角色标识符
+ROLE_ALIASES = {
+    # 门诊场景
+    "doctor": "doctor",
+    "医生": "doctor",
+    "医师": "doctor",
+    "patient": "patient",
+    "患者": "patient",
+    "病人": "patient",
+    
+    # 手术场景
+    "主刀医生": "chief_surgeon",
+    "主刀": "chief_surgeon",
+    "chief_surgeon": "chief_surgeon",
+    "麻醉医生": "anesthesiologist",
+    "麻醉师": "anesthesiologist",
+    "anesthesiologist": "anesthesiologist",
+    "器械护士": "instrument_nurse",
+    "器械": "instrument_nurse",
+    "instrument_nurse": "instrument_nurse",
+    "一助医生": "first_assistant",
+    "一助": "first_assistant",
+    "first_assistant": "first_assistant",
+    "二助医生": "second_assistant",
+    "二助": "second_assistant",
+    "second_assistant": "second_assistant",
+    
+    # 查房场景
+    "主治医生": "attending_doctor",
+    "主治": "attending_doctor",
+    "attending_doctor": "attending_doctor",
+    "住院医生": "resident_doctor",
+    "住院医": "resident_doctor",
+    "resident_doctor": "resident_doctor",
+    "实习生": "intern",
+    "实习医生": "intern",
+    "intern": "intern",
+    
+    # 护理场景
+    "护士": "nurse",
+    "护士长": "head_nurse",
+    "nurse": "nurse",
+}
+
+# 角色显示名称（用于日志输出）
+ROLE_DISPLAY_NAMES = {
+    "doctor": "医生",
+    "patient": "患者",
+    "chief_surgeon": "主刀医生",
+    "anesthesiologist": "麻醉医生",
+    "instrument_nurse": "器械护士",
+    "first_assistant": "一助医生",
+    "second_assistant": "二助医生",
+    "attending_doctor": "主治医生",
+    "resident_doctor": "住院医生",
+    "intern": "实习生",
+    "nurse": "护士",
+    "head_nurse": "护士长",
+}
+
+
+def normalize_role(role_text: str) -> Optional[str]:
+    """
+    将角色文本标准化为统一的角色标识符。
+    
+    Args:
+        role_text: 原始角色文本，如 "主刀医生"、"医生"、"患者" 等
+    
+    Returns:
+        标准化后的角色标识符，如 "chief_surgeon"、"doctor"、"patient"
+        如果无法识别，返回 None
+    """
+    role_text = role_text.strip().lower()
+    
+    # 1. 直接匹配
+    if role_text in ROLE_ALIASES:
+        return ROLE_ALIASES[role_text]
+    
+    # 2. 部分匹配（按优先级排序，优先匹配更具体的角色）
+    priority_patterns = [
+        # 手术场景（优先匹配，因为包含"医生"等通用词）
+        ("主刀", "chief_surgeon"),
+        ("麻醉", "anesthesiologist"),
+        ("器械", "instrument_nurse"),
+        ("一助", "first_assistant"),
+        ("二助", "second_assistant"),
+        # 查房场景
+        ("主治", "attending_doctor"),
+        ("住院医", "resident_doctor"),
+        ("实习", "intern"),
+        # 护理场景
+        ("护士长", "head_nurse"),
+        ("护士", "nurse"),
+        # 门诊场景（最后匹配，作为兜底）
+        ("医生", "doctor"),
+        ("医师", "doctor"),
+        ("患者", "patient"),
+        ("病人", "patient"),
+    ]
+    
+    for pattern, role_id in priority_patterns:
+        if pattern in role_text:
+            return role_id
+    
+    # 3. 无法识别的角色 - 使用原始文本作为标识符（转为小写，去空格）
+    # 这样可以支持任意自定义角色
+    sanitized = re.sub(r'\s+', '_', role_text.strip())
+    if sanitized:
+        return sanitized
+    
+    return None
+
+
 def parse_dialogue_file(filepath: Path) -> List[Dict[str, str]]:
     """
     解析对话文本文件。
     
-    格式示例：
+    支持多种场景的角色格式：
+    
+    门诊对话示例：
         [医生] 您好，请问哪里不舒服？
         [患者] 我最近总是头痛。
-        [医生] 头痛持续多久了？
-        [患者] 大概三天了。
     
-    返回：[{"role": "doctor", "text": "您好..."}, {"role": "patient", "text": "我最近..."}]
+    手术记录示例：
+        [主刀医生] 麻醉医生，患者生命体征如何？
+        [麻醉医生] 血压125/80，血氧98%，生命体征平稳。
+        [器械护士] 结肠镜已准备就绪。
+        [一助医生] 主刀，患者EMR记录显示有慢性浅表性胃炎病史。
+    
+    查房问诊示例：
+        [主治医生] 今天感觉怎么样？
+        [患者] 比昨天好多了。
+        [住院医生] 体温已经正常了。
+        [实习生] 血常规结果也恢复正常了。
+    
+    返回：[{"role": "chief_surgeon", "text": "...", "role_display": "主刀医生"}, ...]
     """
     lines = filepath.read_text(encoding="utf-8").strip().splitlines()
     utterances = []
@@ -66,23 +198,48 @@ def parse_dialogue_file(filepath: Path) -> List[Dict[str, str]]:
         role_text = role_text.strip()
         content = content.strip()
         
-        # 识别角色
-        if "医生" in role_text or "医师" in role_text or "doctor" in role_text.lower():
-            role = "doctor"
-        elif "患者" in role_text or "病人" in role_text or "patient" in role_text.lower():
-            role = "patient"
-        else:
-            # 未识别的角色，跳过
+        # 标准化角色
+        role = normalize_role(role_text)
+        if not role:
+            print(f"[WARNING] Unrecognized role: '{role_text}', skipping line")
             continue
         
-        utterances.append({"role": role, "text": content})
+        # 获取显示名称
+        role_display = ROLE_DISPLAY_NAMES.get(role, role_text)
+        
+        utterances.append({
+            "role": role,
+            "role_display": role_display,
+            "text": content
+        })
     
     # 调试：打印解析结果
-    print(f"[DEBUG] parse_dialogue_file: 解析了 {len(utterances)} 句话")
+    print(f"[DEBUG] parse_dialogue_file: parsed {len(utterances)} utterances")
     for i, utt in enumerate(utterances):
-        print(f"        [{i}] role='{utt['role']}' text='{utt['text'][:30]}...'")
+        text_preview = utt['text'][:30] + '...' if len(utt['text']) > 30 else utt['text']
+        print(f"        [{i}] role='{utt['role']}' ({utt['role_display']}) text='{text_preview}'")
     
     return utterances
+
+
+def extract_unique_roles(utterances: List[Dict[str, str]]) -> List[str]:
+    """
+    从对话句子中提取所有唯一的角色，保持出现顺序。
+    
+    Args:
+        utterances: 解析后的对话句子列表
+    
+    Returns:
+        唯一角色列表，按首次出现顺序排列
+    """
+    seen = set()
+    unique_roles = []
+    for utt in utterances:
+        role = utt["role"]
+        if role not in seen:
+            seen.add(role)
+            unique_roles.append(role)
+    return unique_roles
 
 
 def load_speaker_prompt_text(speaker_wav: Path, prompt_prefix: str, default_content: str = "") -> str:
@@ -114,7 +271,7 @@ def load_speaker_prompt_text(speaker_wav: Path, prompt_prefix: str, default_cont
             if file_content:
                 content = file_content
         except Exception as e:
-            print(f"[WARNING] 读取文本文件失败：{txt_file.name} - {e}")
+            print(f"[WARNING] Failed to read text file: {txt_file.name} - {e}")
     
     # 拼接完整的 prompt_text
     return prompt_prefix + content
@@ -130,7 +287,7 @@ def select_speakers(
     
     Args:
         speaker_files: 所有可用的说话人音频文件列表
-        num_speakers: 需要选择的说话人数量（通常是2：医生+患者）
+        num_speakers: 需要选择的说话人数量（根据对话中实际角色数量动态确定）
         seed: 随机种子（用于可复现）
     
     Returns:
@@ -163,9 +320,10 @@ def synthesize_dialogue(
     
     Args:
         cosyvoice: CosyVoice 模型实例
-        utterances: 对话句子列表 [{"role": "doctor", "text": "..."}]
-        speaker_mapping: 角色到音频文件的映射 {"doctor": Path(...), "patient": Path(...)}
-        speaker_prompt_mapping: 角色到完整 prompt 文本的映射 {"doctor": "prefix+content", "patient": "prefix+content"}
+        utterances: 对话句子列表 [{"role": "chief_surgeon", "text": "...", "role_display": "主刀医生"}]
+        speaker_mapping: 角色到音频文件的映射（支持任意数量的角色）
+                         例如：{"chief_surgeon": Path(...), "anesthesiologist": Path(...), ...}
+        speaker_prompt_mapping: 角色到完整 prompt 文本的映射
         output_dir: 输出目录
         dialogue_id: 对话ID（用于文件命名）
         mode: 合成模式
@@ -178,8 +336,8 @@ def synthesize_dialogue(
     output_dir.mkdir(parents=True, exist_ok=True)
     generated_files = []
     
-    # 调试：打印 speaker_mapping
-    print(f"[DEBUG] synthesize_dialogue 收到的 speaker_mapping:")
+    # Debug: print speaker_mapping
+    print(f"[DEBUG] synthesize_dialogue received speaker_mapping:")
     for role_key, spk_path in speaker_mapping.items():
         print(f"        {role_key}: {spk_path} (exists: {spk_path.exists() if hasattr(spk_path, 'exists') else 'N/A'})")
     
@@ -191,10 +349,10 @@ def synthesize_dialogue(
         text = utt["text"]
         speaker_wav = speaker_mapping.get(role)
         
-        print(f"[DEBUG] 处理第 {idx} 句，角色={role}, speaker_wav={speaker_wav}")
+        print(f"[DEBUG] Processing utterance {idx}, role={role}, speaker_wav={speaker_wav}")
         
         if not speaker_wav or not speaker_wav.exists():
-            print(f"[WARNING] 角色 {role} 没有对应的音色文件，跳过：{text[:20]}...")
+            print(f"[WARNING] Role {role} has no speaker file, skipping: {text[:20]}...")
             print(f"           speaker_wav={speaker_wav}, exists={speaker_wav.exists() if speaker_wav else 'None'}")
             continue
         
@@ -203,7 +361,7 @@ def synthesize_dialogue(
         
         # 断点续传：如果已存在且非空，跳过
         if output_file.exists() and output_file.stat().st_size > 1000:
-            print(f"[SKIP] 已存在：{output_file.name}")
+            print(f"[SKIP] Already exists: {output_file.name}")
             generated_files.append(output_file)
             continue
         
@@ -213,10 +371,10 @@ def synthesize_dialogue(
                 # 获取该角色对应的 prompt 文本
                 role_prompt_text = speaker_prompt_mapping.get(role)
                 if not role_prompt_text:
-                    print(f"[ERROR] 角色 {role} 没有对应的 prompt 文本，跳过")
+                    print(f"[ERROR] Role {role} has no prompt text, skipping")
                     continue
-                print(f"[INFO] 加载 {role} 音色：{speaker_wav.name}")
-                print(f"       prompt文本：{role_prompt_text[:50]}...")
+                print(f"[INFO] Loading {role} speaker voice: {speaker_wav.name}")
+                print(f"       prompt text: {role_prompt_text[:50]}...")
                 
                 if mode == "zero_shot":
                     cached_prompts[role] = cosyvoice.frontend.frontend_zero_shot(
@@ -232,11 +390,11 @@ def synthesize_dialogue(
                 # 清掉空 text（后面每条都会覆盖）
                 cached_prompts[role].pop("text", None)
                 cached_prompts[role].pop("text_len", None)
-                print(f"[INFO] {role} 音色加载成功")
+                print(f"[INFO] {role} speaker voice loaded successfully")
             
             except Exception as e:
-                print(f"[ERROR] 加载 {role} 音色失败：{speaker_wav.name}")
-                print(f"         错误详情：{e}")
+                print(f"[ERROR] Failed to load {role} speaker voice: {speaker_wav.name}")
+                print(f"         Error details: {e}")
                 import traceback
                 traceback.print_exc()
                 # 跳过该角色的所有句子
@@ -259,9 +417,9 @@ def synthesize_dialogue(
                 break  # stream=False 只会 yield 一次
         
         except Exception as e:
-            print(f"[ERROR] 合成失败：{output_file.name}")
-            print(f"         角色：{role}, 文本：{text[:30]}...")
-            print(f"         错误详情：{e}")
+            print(f"[ERROR] Synthesis failed: {output_file.name}")
+            print(f"         Role: {role}, Text: {text[:30]}...")
+            print(f"         Error details: {e}")
             import traceback
             traceback.print_exc()
     
@@ -321,7 +479,7 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
     
     # 加载模型
-    print(f"[INFO] 加载模型：{args.model_dir}")
+    print(f"[INFO] Loading model: {args.model_dir}")
     model_kwargs = {
         "model_dir": args.model_dir,
         "fp16": args.fp16,
@@ -351,7 +509,7 @@ def main():
     except:
         pass
     
-    print(f"[INFO] 模型加载完成：{cosyvoice.__class__.__name__}")
+    print(f"[INFO] Model loaded: {cosyvoice.__class__.__name__}")
     
     # 扫描对话文件
     dialogue_files = sorted(dialogue_dir.glob(args.dialogue_pattern))
@@ -364,38 +522,38 @@ def main():
         raise ValueError(f"音色库目录中没有找到匹配的文件：{speaker_dir / args.speaker_pattern}")
     
     if len(speaker_files) < 2:
-        raise ValueError(f"音色库文件数少于 2，无法分配医生和患者音色")
+        raise ValueError(f"Speaker files count ({len(speaker_files)}) is less than 2, cannot assign voices")
     
-    print(f"[INFO] 对话文件数：{len(dialogue_files)}")
-    print(f"[INFO] 音色文件数：{len(speaker_files)}")
+    print(f"[INFO] Dialogue files count: {len(dialogue_files)}")
+    print(f"[INFO] Speaker files count: {len(speaker_files)}")
     
     # 验证音色文件（快速检查前几个）
-    print(f"[INFO] 验证音色文件...")
+    print(f"[INFO] Validating speaker files...")
     invalid_speakers = []
     for spk_file in speaker_files[:min(5, len(speaker_files))]:
         try:
             wav, sr = torchaudio.load(str(spk_file))
             duration = wav.shape[1] / sr
             if duration > 30:
-                print(f"[WARNING] 音色文件超过30秒限制：{spk_file.name} ({duration:.2f}s)")
-                print(f"           建议裁剪到5-8秒以获得最佳效果")
+                print(f"[WARNING] Speaker file exceeds 30s limit: {spk_file.name} ({duration:.2f}s)")
+                print(f"           Recommend trimming to 5-8s for best results")
                 invalid_speakers.append(spk_file)
             elif duration < 2:
-                print(f"[WARNING] 音色文件过短：{spk_file.name} ({duration:.2f}s)")
-                print(f"           建议使用3秒以上的音频")
+                print(f"[WARNING] Speaker file too short: {spk_file.name} ({duration:.2f}s)")
+                print(f"           Recommend using audio longer than 3s")
         except Exception as e:
-            print(f"[WARNING] 音色文件无法读取：{spk_file.name} - {e}")
+            print(f"[WARNING] Cannot read speaker file: {spk_file.name} - {e}")
             invalid_speakers.append(spk_file)
     
     if invalid_speakers:
-        print(f"[WARNING] 发现 {len(invalid_speakers)} 个问题音色文件，合成时可能出错")
+        print(f"[WARNING] Found {len(invalid_speakers)} problematic speaker files, synthesis may fail")
     
     # 多进程分片：当前进程只处理属于自己的对话
     worker_id = args.worker_id
     num_workers = args.num_workers
     my_dialogues = [f for i, f in enumerate(dialogue_files) if i % num_workers == worker_id]
     
-    print(f"[INFO] 进程 {worker_id}/{num_workers}，负责 {len(my_dialogues)} 个对话")
+    print(f"[INFO] Worker {worker_id}/{num_workers}, handling {len(my_dialogues)} dialogues")
     
     # 记录统计
     total_dialogues = len(my_dialogues)
@@ -405,42 +563,59 @@ def main():
     # 逐个对话处理
     for idx, dialogue_file in enumerate(my_dialogues, 1):
         dialogue_id = dialogue_file.stem  # 文件名（不含扩展名）
-        print(f"\n[{idx}/{total_dialogues}] 处理对话：{dialogue_id}")
+        print(f"\n[{idx}/{total_dialogues}] Processing dialogue: {dialogue_id}")
         
         try:
             # 解析对话
             utterances = parse_dialogue_file(dialogue_file)
             if not utterances:
-                print(f"[WARNING] 对话文件为空或格式不正确，跳过：{dialogue_file.name}")
+                print(f"[WARNING] Dialogue file is empty or incorrectly formatted, skipping: {dialogue_file.name}")
                 continue
             
-            print(f"  - 共 {len(utterances)} 句对话")
+            print(f"  - Total utterances: {len(utterances)}")
             total_utterances += len(utterances)
             
-            # 打印解析后的对话结构（调试用）
-            for i, utt in enumerate(utterances):
-                print(f"    [{i}] {utt['role']}: {utt['text'][:30]}...")
+            # 提取对话中所有唯一角色
+            unique_roles = extract_unique_roles(utterances)
+            num_roles = len(unique_roles)
             
-            # 为该对话随机分配两个音色（医生、患者）
+            if num_roles == 0:
+                print(f"[WARNING] No valid roles found in dialogue, skipping: {dialogue_file.name}")
+                continue
+            
+            # 检查音色文件数是否足够
+            if len(speaker_files) < num_roles:
+                print(f"[WARNING] Not enough speaker files ({len(speaker_files)}) for {num_roles} roles, skipping: {dialogue_file.name}")
+                continue
+            
+            # 打印解析后的对话结构（调试用）
+            print(f"  - Unique roles ({num_roles}): {unique_roles}")
+            for i, utt in enumerate(utterances):
+                text_preview = utt['text'][:30] + '...' if len(utt['text']) > 30 else utt['text']
+                print(f"    [{i}] {utt['role_display']}: {text_preview}")
+            
+            # 为该对话随机分配音色（根据实际角色数量动态分配）
             # 使用 dialogue_id 作为种子，保证每次运行分配相同音色
             dialogue_seed = args.seed + hash(dialogue_id) % 100000
-            selected_speakers = select_speakers(speaker_files, num_speakers=2, seed=dialogue_seed)
+            selected_speakers = select_speakers(speaker_files, num_speakers=num_roles, seed=dialogue_seed)
             
-            speaker_mapping = {
-                "doctor": selected_speakers[0],
-                "patient": selected_speakers[1],
-            }
+            # 动态构建角色到音色的映射
+            speaker_mapping = {}
+            for role, speaker_path in zip(unique_roles, selected_speakers):
+                speaker_mapping[role] = speaker_path
             
-            print(f"  - 医生音色：{selected_speakers[0].name} (存在: {selected_speakers[0].exists()})")
-            print(f"  - 患者音色：{selected_speakers[1].name} (存在: {selected_speakers[1].exists()})")
-            print(f"  - speaker_mapping: {speaker_mapping}")
-            
+            # 打印音色分配信息
+            print(f"  - Speaker assignment:")
+            for role, spk_path in speaker_mapping.items():
+                role_display = ROLE_DISPLAY_NAMES.get(role, role)
+                print(f"    {role_display} ({role}): {spk_path.name}")
             # 为每个角色加载对应的 prompt 文本
             speaker_prompt_mapping = {}
             for role, spk_wav in speaker_mapping.items():
                 prompt_text = load_speaker_prompt_text(spk_wav, args.prompt_prefix, args.default_content)
                 speaker_prompt_mapping[role] = prompt_text
-                print(f"  - {role} prompt文本: {prompt_text[:60]}...")
+                role_display = ROLE_DISPLAY_NAMES.get(role, role)
+                print(f"    {role_display} prompt: {prompt_text[:50]}...")
             
             # 合成对话
             generated = synthesize_dialogue(
@@ -456,7 +631,7 @@ def main():
             )
             
             total_success += len(generated)
-            print(f"  - 成功合成：{len(generated)} 个音频文件")
+            print(f"  - Successfully synthesized: {len(generated)} audio files")
             
             # 保存元数据（方便后续追溯）
             meta_file = output_dir / dialogue_id / f"{dialogue_id}_meta.json"
@@ -471,17 +646,17 @@ def main():
             meta_file.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
         
         except Exception as e:
-            print(f"[ERROR] 处理对话失败：{dialogue_file.name} - {e}")
+            print(f"[ERROR] Failed to process dialogue: {dialogue_file.name} - {e}")
             import traceback
             traceback.print_exc()
     
-    # 最终统计
+    # Final statistics
     print("\n" + "=" * 60)
-    print(f"[完成] 进程 {worker_id}/{num_workers}")
-    print(f"  - 处理对话数：{total_dialogues}")
-    print(f"  - 总句子数：{total_utterances}")
-    print(f"  - 成功合成：{total_success} 个音频")
-    print(f"  - 输出目录：{output_dir}")
+    print(f"[DONE] Worker {worker_id}/{num_workers}")
+    print(f"  - Dialogues processed: {total_dialogues}")
+    print(f"  - Total utterances: {total_utterances}")
+    print(f"  - Successfully synthesized: {total_success} audio files")
+    print(f"  - Output directory: {output_dir}")
     print("=" * 60)
 
 
