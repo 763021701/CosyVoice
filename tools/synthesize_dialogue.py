@@ -215,7 +215,7 @@ def parse_dialogue_file(filepath: Path) -> List[Dict[str, str]]:
     
     # 调试：打印解析结果
     print(f"[DEBUG] parse_dialogue_file: parsed {len(utterances)} utterances")
-    for i, utt in enumerate(utterances):
+    for i, utt in enumerate(utterances[:5]):
         text_preview = utt['text'][:30] + '...' if len(utt['text']) > 30 else utt['text']
         print(f"        [{i}] role='{utt['role']}' ({utt['role_display']}) text='{text_preview}'")
     
@@ -449,7 +449,7 @@ def main():
     
     # 多进程参数
     parser.add_argument("--worker-id", type=int, default=0, help="当前进程编号（0-based）")
-    parser.add_argument("--num-workers", type=int, default=6, help="总进程数（用于数据分片）")
+    parser.add_argument("--num-workers", type=int, default=1, help="总进程数（用于数据分片）")
     
     # 随机种子
     parser.add_argument("--seed", type=int, default=42, help="随机种子（用于可复现的音色分配）")
@@ -590,7 +590,7 @@ def main():
             
             # 打印解析后的对话结构（调试用）
             print(f"  - Unique roles ({num_roles}): {unique_roles}")
-            for i, utt in enumerate(utterances):
+            for i, utt in enumerate(utterances[:5]):
                 text_preview = utt['text'][:30] + '...' if len(utt['text']) > 30 else utt['text']
                 print(f"    [{i}] {utt['role_display']}: {text_preview}")
             
@@ -615,7 +615,7 @@ def main():
                 prompt_text = load_speaker_prompt_text(spk_wav, args.prompt_prefix, args.default_content)
                 speaker_prompt_mapping[role] = prompt_text
                 role_display = ROLE_DISPLAY_NAMES.get(role, role)
-                print(f"    {role_display} prompt: {prompt_text[:50]}...")
+                # print(f"    {role_display} prompt: {prompt_text[:50]}...")
             
             # 合成对话
             generated = synthesize_dialogue(
