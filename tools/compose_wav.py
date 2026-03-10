@@ -9,7 +9,7 @@ import torchaudio
 import torch
 
 
-def concatenate_wav_files(input_dir, output_path, sort_by="name", silence_duration=0.5):
+def concatenate_wav_files(input_dir, output_path, sort_by="name", silence_duration=0.5, verbose=True):
     """
     Concatenate all WAV files in input directory into a single file
     
@@ -18,6 +18,7 @@ def concatenate_wav_files(input_dir, output_path, sort_by="name", silence_durati
         output_path: Path for output concatenated file
         sort_by: Sorting method - "name", "modified_time", or "none"
         silence_duration: Duration of silence (in seconds) to add between audio files
+        verbose: Whether to print detailed progress info
     """
     input_dir = Path(input_dir)
     output_path = Path(output_path)
@@ -35,17 +36,19 @@ def concatenate_wav_files(input_dir, output_path, sort_by="name", silence_durati
         wav_files.sort(key=lambda x: x.stat().st_mtime)
     # If sort_by is "none", keep original order (glob may be unsorted)
     
-    print(f"Found {len(wav_files)} WAV files:")
-    for i, wav_file in enumerate(wav_files):
-        print(f"  {i+1:3d}. {wav_file.name}")
+    if verbose:
+        print(f"Found {len(wav_files)} WAV files:")
+        for i, wav_file in enumerate(wav_files):
+            print(f"  {i+1:3d}. {wav_file.name}")
     
     # Load first file to get sample rate and channels
     first_audio, sample_rate = torchaudio.load(str(wav_files[0]))
     num_channels = first_audio.shape[0]
     
-    print(f"\nSample rate: {sample_rate}Hz")
-    print(f"Channels: {num_channels}")
-    print(f"Duration of first file: {first_audio.shape[1]/sample_rate:.2f}s")
+    if verbose:
+        print(f"\nSample rate: {sample_rate}Hz")
+        print(f"Channels: {num_channels}")
+        print(f"Duration of first file: {first_audio.shape[1]/sample_rate:.2f}s")
     
     # Calculate silence tensor
     silence_samples = int(silence_duration * sample_rate)
@@ -70,14 +73,16 @@ def concatenate_wav_files(input_dir, output_path, sort_by="name", silence_durati
         concatenated_audio = torch.cat([concatenated_audio, silence_tensor, audio], dim=1)
         duration = audio.shape[1] / sr
         total_duration += duration + silence_duration  # Include silence in total duration
-        print(f"Added {wav_file.name} ({duration:.2f}s) + {silence_duration}s silence, total: {total_duration:.2f}s")
+        if verbose:
+            print(f"Added {wav_file.name} ({duration:.2f}s) + {silence_duration}s silence, total: {total_duration:.2f}s")
     
     # Save concatenated audio
     output_path.parent.mkdir(parents=True, exist_ok=True)
     torchaudio.save(str(output_path), concatenated_audio, sample_rate)
     
-    print(f"\nSuccessfully saved concatenated audio to: {output_path}")
-    print(f"Total duration: {total_duration:.2f}s ({int(total_duration//60):d}:{total_duration%60:05.2f})")
+    if verbose:
+        print(f"\nSuccessfully saved concatenated audio to: {output_path}")
+        print(f"Total duration: {total_duration:.2f}s ({int(total_duration//60):d}:{total_duration%60:05.2f})")
     return True
 
 
@@ -111,6 +116,11 @@ if __name__ == "__main__":
         default=1,
         help="Duration of silence (in seconds) to insert between audio files"
     )
+    parser.add_argument(
+        "-q", "--quiet",
+        action="store_true",
+        help="Suppress detailed output"
+    )
     
     args = parser.parse_args()
     
@@ -118,7 +128,8 @@ if __name__ == "__main__":
         input_dir=args.input_dir,
         output_path=args.output_path,
         sort_by=args.sort_by,
-        silence_duration=args.silence_duration
+        silence_duration=args.silence_duration,
+        verbose=not args.quiet
     )
     
     if success:
