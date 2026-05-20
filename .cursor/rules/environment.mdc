@@ -1,0 +1,30 @@
+---
+description: Use the project Conda environment
+alwaysApply: true
+---
+
+When running shell commands for this project, always use the Conda environment named `cosyvoice`.
+
+For Python commands, use:
+
+    conda run -n cosyvoice python
+
+For package installation, use:
+
+    conda run -n cosyvoice pip install <package>
+
+For running tests, use:
+
+    conda run -n cosyvoice pytest
+
+Do not use the system Python.
+
+Do not use plain `python`, `python3`, `pip`, or `pip3` unless the Conda environment is already active.
+
+Before running Python-related commands, prefer verifying the interpreter with:
+
+    conda run -n cosyvoice python -c "import sys; print(sys.executable)"
+
+If a command needs to run a Python module, use:
+
+    conda run -n cosyvoice python -m <module>
