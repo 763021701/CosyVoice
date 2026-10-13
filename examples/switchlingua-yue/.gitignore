@@ -1,0 +1,10 @@
+# The pathology data roots must stay out of git: their split `text` files are
+# transcribed clinical reports, and wav.scp / lists/*.list / the ASR hyp blocks
+# carry absolute paths into the private dataset.
+#
+# That is the only gap -- the repo-level .gitignore already covers data/, tensorboard/,
+# *.pt and the parquet files (named *.tar but Apache Parquet). With this one line,
+# `git add examples/switchlingua-yue/` takes exactly the 18 code/doc files. Nothing
+# needed to re-read the conclusions lives in git either way: RESULTS.md holds the numbers
+# and exp/*/epoch_*.yaml hold the per-epoch CV metrics.
+data_mix*/
