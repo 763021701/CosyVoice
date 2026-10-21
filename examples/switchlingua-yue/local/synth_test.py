@@ -55,6 +55,12 @@ def main() -> None:
     ap.add_argument('--split', default='test')
     ap.add_argument('--out-root', type=Path, required=True)
     ap.add_argument('--limit', type=int, default=0, help='only synthesize the first N (for a timing smoke)')
+    ap.add_argument('--shard', default='', metavar='K/N',
+                    help='take only every Nth utterance (offset K) of the sorted list, so several workers can '
+                          'split one cell without ever generating the same utt. NOTE: <arm>.manifest.json and '
+                          '<arm>.failed.json then describe only this shard -- rerun the cell with no --shard '
+                          'once all shards are done to rewrite them over the whole corpus (every clip is '
+                          'already on disk, so that pass only reads headers)')
     ap.add_argument('--seed', type=int, default=1986,
                     help='ras_sampling draws from a multinomial; reseed per arm so a run is reproducible')
     args = ap.parse_args()
@@ -63,9 +69,14 @@ def main() -> None:
     pairs = json.loads(pairs_file.read_text())
     text = {l.split(maxsplit=1)[0]: l.split(maxsplit=1)[1]
             for l in (args.data_root / args.split / 'text').read_text().splitlines()}
+    # a text-only generation corpus has no reference audio at all: empty map => real_sec stays None downstream
+    wav_scp = args.data_root / args.split / 'wav.scp'
     wav = {l.split(maxsplit=1)[0]: l.split(maxsplit=1)[1]
-           for l in (args.data_root / args.split / 'wav.scp').read_text().splitlines()}
+           for l in wav_scp.read_text().splitlines()} if wav_scp.is_file() else {}
     order = sorted(pairs)
+    if args.shard:
+        k, n = (int(x) for x in args.shard.split('/'))
+        order = order[k::n]
     if args.limit:
         order = order[:args.limit]
 
@@ -93,7 +104,8 @@ def main() -> None:
             if dest.is_file():  # resume: a crashed run continues rather than redoing everything
                 manifest.append({'utt': utt, 'synth_wav': str(dest),
                                  'synth_sec': round(seconds(str(dest)), 3),
-                                 'real_sec': round(seconds(wav[utt]), 3), 'fallback': p['fallback'],
+                                 'real_sec': round(seconds(wav[utt]), 3) if utt in wav else None,
+                                 'fallback': p['fallback'],
                                  'same_item': p['same_item'], 'text': text[utt]})
                 continue
             try:
@@ -101,7 +113,7 @@ def main() -> None:
                     text[utt], INSTRUCT + p['prompt_text'], p['prompt_wav'],
                     stream=False, text_frontend=False)]
                 speech = torch.concat(chunks, dim=1)
-            except RuntimeError as e:
+            except Exception as e:  # noqa: BLE001 - a 30k-clip run must survive anything one clip can raise
                 # One degenerate utterance must not kill a 2h run. ep9 raised "sampling reaches max_trials
                 # 100 and still get eos when ignore_eos is True" inside llm_job; the thread died, tts()
                 # carried on with zero tokens and blew up later in hift on a 3-frame mel.
@@ -110,19 +122,27 @@ def main() -> None:
             torchaudio.save(str(dest), speech, cosyvoice.sample_rate)
             manifest.append({'utt': utt, 'synth_wav': str(dest),
                              'synth_sec': round(speech.shape[1] / cosyvoice.sample_rate, 3),
-                             'real_sec': round(seconds(wav[utt]), 3),
+                             'real_sec': round(seconds(wav[utt]), 3) if utt in wav else None,
                              'fallback': p['fallback'], 'same_item': p['same_item'],
                              'text': text[utt]})
         if failed:
             (args.out_root / f'{name}.failed.json').write_text(
                 json.dumps(failed, indent=1, ensure_ascii=False) + '\n')
             print(f'  {name}: {len(failed)} utt failed, see {name}.failed.json')
+        elif not args.shard and (args.out_root / f'{name}.failed.json').is_file():
+            # a clean rerun leaves the previous run's list behind, and both `status` and the QC completeness
+            # gate read it as if it were current -- 15 utts reported failed forever after they had succeeded.
+            # Only a whole-cell pass may remove it: under --shard each worker sees part of the corpus.
+            (args.out_root / f'{name}.failed.json').unlink()
+            print(f'  {name}: all utts regenerated clean, removed the stale {name}.failed.json')
         (args.out_root / f'{name}.manifest.json').write_text(
             json.dumps(manifest, indent=1, ensure_ascii=False) + '\n')
         syn = sum(m['synth_sec'] for m in manifest)
-        real = sum(m['real_sec'] for m in manifest)
-        print(f'  {name}: {len(manifest)} wav, {syn:.0f}s synth vs {real:.0f}s real -> duration ratio '
-              f'{syn / real:.3f}')
+        # a generation corpus has no real reference: report synth hours alone rather than a fake ratio
+        real = sum(m['real_sec'] for m in manifest if m['real_sec'] is not None)
+        tail = (f' vs {real:.0f}s real -> duration ratio {syn / real:.3f}' if real else
+                f' ({syn / 3600:.2f} h synth, no reference audio in this root)')
+        print(f'  {name}: {len(manifest)} wav, {syn:.0f}s synth{tail}')
 
 
 if __name__ == '__main__':

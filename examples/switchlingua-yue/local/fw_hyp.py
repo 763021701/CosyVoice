@@ -16,6 +16,7 @@ unchanged. Run in the whisper_ft env (it is the one with faster_whisper + ctrans
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 from pathlib import Path
 
@@ -31,6 +32,9 @@ def main() -> None:
     ap.add_argument('--out-root', type=Path, required=True)
     ap.add_argument('--arms', nargs='+', required=True)
     ap.add_argument('--split', default='test')
+    ap.add_argument('--sample', type=float, default=0.0,
+                    help='fraction of the intersection to read, same md5 rule as asr_score.py -- use a smaller '
+                         'sample here: this reader only has to confirm the ordering between arms, not the rate')
     ap.add_argument('--model-dir', default=MODEL)
     args = ap.parse_args()
 
@@ -42,18 +46,23 @@ def main() -> None:
 
     ref = {l.split(maxsplit=1)[0]: l.split(maxsplit=1)[1]
            for l in (args.data_root / args.split / 'text').read_text().splitlines()}
+    wav_scp = args.data_root / args.split / 'wav.scp'
     real = {l.split(maxsplit=1)[0]: l.split(maxsplit=1)[1]
-            for l in (args.data_root / args.split / 'wav.scp').read_text().splitlines()}
+            for l in wav_scp.read_text().splitlines()} if wav_scp.is_file() else {}
     keep = [u for u in sorted(ref) if all((args.out_root / a / f'{u}.wav').is_file() for a in args.arms)]
-    print(f'{len(keep)} utt in the intersection of arms {args.arms}')
+    if args.sample:
+        keep = [u for u in keep if int(hashlib.md5(u.encode()).hexdigest()[:8], 16) % 1000 < int(args.sample * 1000)]
+    print(f'{len(keep)} utt in the intersection of arms {args.arms}'
+          + (f' (--sample {args.sample:.2f})' if args.sample else ''))
 
     def read(path):
         segs, _ = model.transcribe(str(path), beam_size=5, task='transcribe', condition_on_previous_text=False)
         return ' '.join(s.text.strip() for s in segs).strip()
 
     hyp = {}
-    for arm, paths in (('real', {u: real[u] for u in keep}),
-                       *[(a, {u: str(args.out_root / a / f'{u}.wav') for u in keep}) for a in args.arms]):
+    readers = ([('real', {u: real[u] for u in keep})] if real and all(u in real for u in keep) else []) + \
+              [(a, {u: str(args.out_root / a / f'{u}.wav') for u in keep}) for a in args.arms]
+    for arm, paths in readers:
         hyp[arm] = {p: read(p) for p in paths.values()}
         print(f'{arm}: {len(hyp[arm])} read')
     (args.out_root / 'asr_fw.json').write_text(json.dumps({'hyp': hyp}, indent=1, ensure_ascii=False) + '\n')

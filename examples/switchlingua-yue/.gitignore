@@ -8,3 +8,7 @@
 # needed to re-read the conclusions lives in git either way: RESULTS.md holds the numbers
 # and exp/*/epoch_*.yaml hold the per-epoch CV metrics.
 data_mix*/
+# data_synth/ is the same problem in a new folder: cell `text` files are clinical report sentences and the
+# libraries / pairs / plan jsons carry absolute paths into the private dataset. Repo-level rules only cover
+# `data/` and `*.wav`, so without this line `git add examples/switchlingua-yue/` would stage them.
+data_synth/

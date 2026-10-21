@@ -14,6 +14,8 @@
 4. **根因在音频，不在标签写法**：MossFormer2 去噪切片里有大量多秒静音，speech tokenizer 忠实地把静音编成近恒定的低位 token（id 243/270），模型学会了「吐一长串静音 token」。同一批切分在**未增强原声**上主导 token 占比从 0.716/0.585/0.548 降到 0.171/0.082/0.236 —— 退化是增强引入的。
 5. **清洗后崩溃完全消失**（0 静音）、punct 念出率回到 42.4%（清洗前 18.6%），两个独立解码器同向。新域仍不如 base（49.7% vs 32.1%），且这次同时改了「去静音」和「数据量减半」，**两件事尚未分离**。
 6. 方法学两条硬教训：**混合训练的 CV 曲线必须分源看**（聚合曲线选 ep1，新域最优点是 ep0）；**teacher-forced CE 在这个任务上是可失效的指标**（三次与合成结果解耦）。
+7. **R4：用 `ft_ep1` 把两份病理文本语料合成了 31,566 条音频（83 h），对照两种参考语音库** —— SL 库英文词更准（B 臂 overall 28.45% vs 41.99%），病理库中文数字更准（zh 90.19% vs 98.92%），音色跟随两臂同样好；
+   而病理臂暴露出一个与音色无关的缺陷：**prompt ≥20 s 时 43% 的音频提前结束、少念词**。换 ≤12 s 的 prompt 做一轮定向返工，配对检验缺词率 **23.8% → 0.0%**。详见 §9。
 
 ---
 
@@ -55,8 +57,9 @@
 |---|---|---|
 | `data/` | 3.7G | SL 独有：5767/778/727、`split_report.json`、R1 的 `synth/{base,ep1,ep9}`、`ft_model/`（即用模型目录）、`adhoc/`（gallbladder + 标点探针） |
 | `data_mix/` | 932M | 脏病理半区 431/71/57、`label_audit.jsonl`（159 条改写）、`lists/`、R2 的 `synth/`、`synth_sltest/`、`synth_nofail/`（软链，实际 0 字节）、`synth_seed2/`（seed 对照） |
-| `data_mix_clean/` | 560M | 清洗后 227/51/33，`wav.scp` 指向**本项目内的裁剪副本**，`clean_report.json` + 每 split 的 `silence_stats.jsonl`，R3 输出 |
+| `data_mix_clean/` | 4.4G | 清洗后 227/51/33，`wav.scp` 指向**本项目内的裁剪副本**，`clean_report.json` + 每 split 的 `silence_stats.jsonl`，R3 输出，`ft_ep0/` `ft_ep1/`（即用模型目录） |
 | `data_mix_xp/` | 15M | 单用途对照：清洗模型 + **未裁剪带长停顿的 prompt** |
+| `data_synth/` | 15G | R4 生成语料：`libraries/`（两臂库+指纹）、`corpus/{A,B}/`（快照+source_map）、`cells/<cell>{,_repair,_pilot}/`（4 格与返工/预演）、`synth/`（31,566 wav + manifest + 两把尺子的 hyp）、`qc/`（门禁表、逐条指标、返工存档） |
 
 软链关系（删错会静默打断对照臂）：
 
@@ -66,7 +69,15 @@ data_mix_clean/synth_sltest/old_ep1 → data/synth/ep1
 data_mix_clean/synth_sltest/base    → data_mix/synth_sltest/base   (SL 侧未变，复用不重算)
 data_mix_xp/{test,train}            → data_mix_clean/{test,train}
 data/ft_model/llm.pt  ⇄  data/ep1_llm_stripped.pt   (同 inode，links=2，单删一个释放 0)
+data_mix_clean/ft_ep{0,1}/llm.pt                    ← epoch_{0,1}_whole.pt 的**独立副本**（非硬链，2.0G/个）
+data_mix_clean/ft_ep{0,1}/{flow,hift}.pt,onnx,yaml,asset,CosyVoice-BlankEN
+                                                    → 基座模型目录（只训了 LLM，其余原样）
 ```
+
+即用目录里的 `llm.pt` 必须是副本而非软链：`CosyVoiceModel.load` 用 `strict=True`（`cosyvoice/cli/model.py:66`），
+而 `epoch_N_whole.pt` 除 293 个参数外还多带 `epoch`/`step` 两个记账键，直接指过去会在构造时报 unexpected keys。
+`local/package_ft_model.py` 做这次剥离，并断言剥离后的键集与 dtype 都和基座 `llm.pt` 完全一致。
+因此**重训会留下旧副本**：`exp/*/epoch_1_whole.pt` 变了，`ft_ep1/llm.pt` 不会自己跟着变。
 
 清洗版 `synth_sltest/base` 是软链：SL 的 prompt、模型、seed 都没变，重合成 727 条是浪费 —— 但因此**删 `data_mix/synth_sltest/base` 会让 R3 的 SL 对照失效**。
 
@@ -264,6 +275,135 @@ MIX_DIR=$PWD/data_mix_clean EXP_DIR=$PWD/exp/cosyvoice3_mixclean/llm/torch_ddp \
   --data-root data_mix_clean --out-root data_mix_clean/synth --arms base ep0 ep1
 python -I local/punct_metric.py --asr data_mix_clean/synth/asr_fw.json \
   --data-root data_mix_clean --split test
+
+# 打成即用模型目录（基座其余文件软链过来，只重写 llm.pt）
+python local/package_ft_model.py --ckpt exp/cosyvoice3_mixclean/llm/torch_ddp/epoch_1_whole.pt \
+  --out data_mix_clean/ft_ep1
 ```
 
-脚本清单：`local/{prepare_data,prepare_mix_data,clean_pathology,make_parquet,cosyvoice_train,eval_token,build_prompt_pairs,synth_test,asr_score,punct_metric,token_distance,fw_hyp}.py`；`run.sh`（R1）、`run_mix.sh`（R2/R3，参数化）。`exp/`、`data*/`、`*.pt` 均在 `.gitignore` 内，不会污染提交。
+加载即用目录。**这两个补丁不能省** —— 本机的 transformers 5 / torch 2.11 下，缺 `fix_incremental_decoding`
+时每条音频都退化成重复环，缺 `force_qwen2_fp32` 时 `llm_job` 线程中途死掉、`tts()` 后面在 3 帧 mel 上崩：
+
+```python
+import sys; sys.path[:0] = ['<repo>', '<repo>/third_party/Matcha-TTS', '<repo>/examples/switchlingua-yue/local']
+from cosyvoice_train import force_qwen2_fp32, fix_incremental_decoding
+from cosyvoice.cli.cosyvoice import CosyVoice3
+force_qwen2_fp32(); fix_incremental_decoding()
+cv = CosyVoice3('data_mix_clean/ft_ep1', load_trt=False, load_vllm=False, fp16=False)
+# 每次 inference 都要 text_frontend=False：训练侧完全没做正则，而本机没装 wetext/ttsfrd 也不影响
+# frontend 把 "." 改成 "。"、" - " 改成 "，"（frontend.py:145-146）。本实验的标签就是 ". Full stop."
+# 里的 ASCII 句点，让它过一遍 frontend 等于自己改掉自己要测的东西。
+```
+
+等价性核对过：`ft_ep1/llm.pt` 的 293 个张量与 `epoch_1_whole.pt` 逐个 `torch.equal`；用它按 stage 7 的方式
+（同 prompt 配对、同 seed 1986）重合成清洗 test 前 3 条，wav 的 md5 与产出报告数值的
+`data_mix_clean/synth/ep1/` **逐字节相同**（`ft_ep0` 同样核对，1 条）。所以即用目录和被测的是同一个模型，
+不是「大概一样」。
+
+## 9. R4：用 `ft_ep1` 合成两份病理文本语料（唯一变量 = 参考语音库）
+
+问题：同一个 LLM、同一批文本，只把 zero-shot 的**参考语音库**从「英粤 code-switch」换成「病理口述原件」，
+生成音频在可懂度 / 念出率 / 音色跟随 / 退化率上差多少 —— 以及这批音频能不能拿去训 ASR。
+
+### 9.1 输入与两臂
+
+| | 内容 |
+|---|---|
+| 模型 | 只有 `data_mix_clean/ft_ep1`（与被测权重逐字节相同，见 §8） |
+| 语料 A | `CosyVoice/data/pathology/llm_syn_sentences.jsonl` **1,884 条**（md5 `4330393b…`，14 个 category_id，无 id 字段 ⇒ uttid 用 `A{行号:05d}`） |
+| 语料 B | `…/tts_corpus_final_normalized.jsonl` **13,899 条**（md5 `92fe1ecf…`，13,842 unique，mode: dictation_period 3,473 / dictation_filler 2,353 / written_report 4,020 / written_hk 1,779 / origin=real 2,274） |
+| slref 库 | `data/{train,dev,test}` 全部 **7,272** 条 / 10.61 h / 1,701 个 item（prompt 时长中位 **5.0 s**） |
+| pathref 库 | `from_denoised` 501 + `output_v6_asr_sync` 188 = 689 → **660** 条 / 1.94 h / 28 位医生（中位 **10.2 s**）。排除 22 条重复 case `13488`、4 条 >30 s（撞 `frontend.py:97` 硬 assert）、3 条 <1 s |
+| 产物 | 4 cell × 各语料 = **31,566 个 wav**，约 **83 h**，24 kHz PCM_16，14 G |
+
+两份输入文件在检查期间被改过（B 的 mtime 17:39），所以 `plan.json` 记录 md5/mtime/行数，cell 里落**快照**；
+pilot 与全量读同一份快照，避免中途换版混文本。
+
+### 9.2 文本口径：只改词形，不给裸句号补念出词
+
+只 import `prepare_mix_data.RULES`，实测命中：`(?<![A-Za-z])m m(?![A-Za-z])→mm` 打中 **1,977 条**（A 137 / B 1,840）。
+`period`/`comma` 两条规则在**新版语料上命中 0 次**（旧版结尾裸词 `period` 的形态已被语料作者改成 `. Period.`），保留作保险网。
+
+明确**不做**：句尾裸 `.` 不补词 —— 真实医生口述只有 **21.0%** 的句尾带念出词、逗号 **7.9%**，而语料自带 A 14.4% / B 2.8%；
+补到 100% 就变成没有医生这样读的东西。` c m` 保持分写（训练侧 ` c m` 150 vs `cm` 33，分写才是多数形态 —— 这条与最初口头说的相反，按实测改回）。
+`dash` 保留（训练侧故意保留）。大小写不动（B 有 13,833 条小写开头，训练文本自己也有 73/431 条小写开头 ⇒ 分布内）。
+
+> 事实更正：病理转录里的 `...` 是**读者迟疑/自我修正**的标记（B 侧 90 + C 侧 12 条，句中 63 / 句尾 27，
+> 时长中位 10.4 s 反而比不含它的 12.0 s 更短），不是音频与文字错位。因此它作为 prompt 材料是合法的，
+> 全部放回库里（559 → 660）。`prepare_mix_data.py:unusable()` 里那条判据的名字 `gap_in_transcript` 是误称，实为 hesitation。
+
+### 9.3 轮转顺序必须"发牌"
+
+同一 item / case 有 4–42 条连续成员，按字典序排会让**相邻目标拿到同一个人**。改成 `for r in range(max_group): for grp in sorted(groups): 取 grp[r]`，
+实测相邻同人只有 slref 4 处 / pathref 7 处。覆盖率：A_slref 1,884 条用 1,884 个不同 prompt（1,701 人），
+B_slref 用满 7,272，两格 pathref 用满 660 / 28 位医生（复用 2.9× / 21.1×）。
+`build_prompt_pairs.py` 没动：它的同 item 配对 + `utt2embedding` 依赖是「测量」专用设计，混进轮转会毁掉 R1/R3 的可复现性。
+
+### 9.4 两臂分工（qwen3 5% 随机 + whisper-yue 2%，两把尺子每个比较都同向）
+
+| cell | overall | en | zh | ins/ref | 第二解码器 overall (n) | vratio 中位 | cos(自己prompt) | cos(对照) |
+|---|---|---|---|---|---|---|---|---|
+| A_slref | 36.21% | 24.90% | 96.52% | 1.13% | 43.62% (36) | 1.07 | 0.815 | 0.206 |
+| A_pathref | 54.53% | 43.45% | 76.62% | 6.36% | 89.36% (36) | 0.90 | 0.820 | 0.460 |
+| B_slref | 28.45% | 20.52% | 98.92% | 2.80% | 36.04% (311) | 1.08 | 0.820 | 0.253 |
+| B_pathref | 41.99% | 32.86% | 90.19% | 5.37% | 54.95% (311) | 0.92 | 0.829 | 0.466 |
+
+- **SL 参考音把英文词读得更准，病理参考音把中文数字读得更好**；overall 由英文主导（12,130–13,255 en 单位 vs 201–928 zh 单位）所以 SL 臂总分为优。
+- `ins/ref` 病理臂高 2–5 倍 ⇒ 更多幻听/加词。
+- 音色跟随两臂同样好（0.815–0.829，与实测真实同人配对 SL 0.831 / 病理 0.853 同档），但**对照差**是 slref 0.55–0.60、pathref 0.35 ——
+  病理库只有 28 个人、彼此音色接近，所以同一把尺子下天然分不高，两臂的绝对值不可直接比。
+- 中文数字这一项对所有 cell 都是 76–99% 错：**语料里 `三點二`、`九十 dash year old` 这类中文数词，在生成音频上几乎不被 qwen3 认出来**。
+
+标点词的念出率只在**刻意过采样的分层 pilot** 上有分辨力（A 58 个词实例：qwen3 20.7% vs 10.3%、whisper 31.0% vs 10.3%，SL 参考音占优）；
+随机 5% 里 `Full stop` 的 ref 计数是 **0**（全语料只有 A 25 / B 2 条，5% 期望 ~1.4 条），`Period` 也只有 13–22 个实例，
+A 侧两臂甚至互相矛盾 —— 这个量不能用随机抽样下结论。
+
+### 9.5 因果：缺词来自 prompt 长度，不是"医生的声音"
+
+返工前按 `vratio`（见 §9.6）点名 1,268 条（4.0%），只把它们的 prompt 换成**同臂 ≤12 s** 的条目
+（优先保留原医生：B_pathref 953/977、A_pathref 131/134；新 prompt 中位 7.6 s、上限 12.0 s；绝不复用刚失败的那条）：
+
+| 原 prompt 时长 | pathref 缺词率 | slref 缺词率 |
+|---|---|---|
+| <6 s | 3.3 / 3.4% | 0.7 / 1.7% |
+| 6–12 s | 2.6 / 3.5% | 0.3 / 1.5% |
+| 12–20 s | 7.9 / 8.5% | 0.0% |
+| **≥20 s** | **43.3 / 39.0%** | 0.0%（SL 库基本没有长 prompt） |
+
+**配对检验**（同一批 1,266 条文本，返工前后各转写一次，返工前音频存档在 `qc/pre_repair_backup/`）：
+缺词率中位 **23.8% → 0.0%**（B_pathref 28.6%→0.0%，A_pathref 29.0%→6.2%）；489 条从 >30% 修到 <15%，71 条变差（轻度），465 条不变。
+返工后带内比例 `A_slref .998 / A_pathref .985 / B_slref .998 / B_pathref .993`，十项门禁全过，`failed.json` 为 0，一轮即止（没有启用隔离区）。
+
+⇒ 两臂的库时长中位差（5.0 s vs 10.2 s）就是这个现象的原因。这也更正了一次判断：当初用 R3 的「推理 prompt 保留真实停顿更好」把库推回原始未裁边，
+是过度外推 —— **真正的变量是长度，不是停顿**；R3 那条结论仍然成立（停顿丰富的 prompt 对念出率有利），但它不能盖过长 prompt 的截断代价。
+
+### 9.6 度量学教训（四个都栽过）
+
+1. **`score()` 里 `err > 1` 是插入主导，不是缺词。** 我一度把「149 字符的句子只听出一个词」读成截断，实际那些 hyp 是
+   ASR 在长静音上幻觉出的中文/日文句子（`听我说：我回到摩拉奇宫`、`スマフォン、他是大專文科系畢業嘅`）。缺词要用删除量说话。
+2. **新判据 `vratio = 语音时长 / (字符数 / 16.5)`**（16.5 = 实测语音内中位语速，使对照中位正好 1.00）。
+   对照 800 条随机：p05 0.74 / p50 1.00 / p95 1.33 / max 1.84。它是唯一能看见"缺词"的门禁 ——
+   提前 EOS 的条 peak 0.99、时长正常，`peak`/`duration`/`dominant_token` 三道全都会放过去。
+   验证它是删除而非念错：`vratio<0.5×` 时 ref 单位丢 **60.9%**、`0.5–0.72×` 丢 **34.0%**，而插入只有 1.7–2.6%。
+3. **阈值必须按臂归一**（`[0.75, 1.60] × 本格中位`）。绝对带 `[0.6, 1.8]` 会把病理臂整条分布尾巴切掉
+   —— 两臂 vratio 中位差 0.16，绝对带测的是"这个臂说话密度"，不是"这批数据坏没坏"。
+4. **并行吞吐不是线性的，我三次 ETA 都错。** 单进程 4.0 s/条（15.1 条/分），4 worker 只有 26.8 条/分（加速比 1.8×），
+   而 2 worker 掉到 11.2 条/分；重分片（`synth_test.py --shard K/N`，两 worker 领不相交的 utt 集）后 24.0 条/分。
+   另外：多 worker 时日志文件名必须带 shard 标识，否则两个进程 `>` 同一个文件，音频无损但日志不可信（栽过三次，另一类是 `set -u` 下引用未传的 `$3`，四个 worker 秒死而脚本仍 exit 0）。
+
+### 9.7 交付与下游使用
+
+根目录 `data_synth/`（在 `.gitignore` 内：cell `text` 是临床报告句子，libraries/pairs/plan 带私有数据集绝对路径）。
+消费一批音频需要这些文件：`synth/<cell>/<utt>.wav`、`synth/<cell>.manifest.json`（utt→合成时长+文本，`real_sec` 恒为 null）、
+`cells/<cell>/text`（喂进去的归一化文本）、`corpus/{A,B}/source_map.jsonl`（原始记录→文本，含 mode/priority/category 便于分层）、
+`plan.json`（输入 md5 + 库指纹 + cell 表）、`qc/summary.json`（门禁表）、`qc/<cell>.qc.jsonl`（逐条 sec/peak/gap/voiced/vratio/dom_share/cos）。
+
+给 ASR 微调的三条硬警告：① 这是 **TTS 生成**音频，可以训练，但**评估/留出集必须仍是真实录音**，
+否则量到的是「ASR 认自己人合成声音」的能力，对真实医生口述没有推论力；② 标签口径见 §9.2，裸句号没有念出词，
+标签与音频对齐但"该念的标点"只占少数实例（A 358 / B 358 个词实例）；③ 本域 qwen3 在**真实**病理音频上的 floor 是 86–96% 错误率，
+任何绝对分数只能看跨臂差。
+
+---
+
+脚本清单：`local/{prepare_data,prepare_mix_data,clean_pathology,make_parquet,cosyvoice_train,eval_token,build_prompt_pairs,synth_test,asr_score,punct_metric,token_distance,fw_hyp,package_ft_model,make_synth_cells,qc_synth,make_repair_cells}.py`；`run.sh`（R1）、`run_mix.sh`（R2/R3，参数化）、`local/run_synth_cells.sh`（R4：smoke/pilot/full/status）。`exp/`、`data*/`、`data_synth/`、`*.pt` 均在 `.gitignore` 内，不会污染提交。
+（两个 R4 脚本叫 `make_*` 而不是 `build_*`：repo 级 `.gitignore:38` 的 `**/*build*` 会把它们当构建产物忽略掉。）

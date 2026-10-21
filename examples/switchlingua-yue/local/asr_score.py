@@ -21,6 +21,7 @@ between a synthesized arm and real audio on the same ASR and the same scorer.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import re
 import sys
@@ -118,13 +119,20 @@ def main() -> None:
     ap.add_argument('--arms', nargs='*', default=[],
                     help='checkpoint names under out-root; empty means measure the real-audio floor only')
     ap.add_argument('--split', default='test')
+    ap.add_argument('--sample', type=float, default=0.0,
+                    help='score only this fraction of utts, chosen by md5 of the utt id (same rule as '
+                         'qc_synth.py, so the two samples agree and neither depends on process RNG). On this '
+                         'domain the ASR floor is 86-96%, so a full pass over 31.5k clips buys no gate info; '
+                         'a deterministic sample does')
     ap.add_argument('--batch', type=int, default=32)
     args = ap.parse_args()
 
     text = {l.split(maxsplit=1)[0]: l.split(maxsplit=1)[1]
             for l in (args.data_root / args.split / 'text').read_text().splitlines()}
+    # a generation corpus (data_synth) has no reference recording: no real arm, no floor to compare against
+    wav_scp = args.data_root / args.split / 'wav.scp'
     real = {l.split(maxsplit=1)[0]: l.split(maxsplit=1)[1]
-            for l in (args.data_root / args.split / 'wav.scp').read_text().splitlines()}
+            for l in wav_scp.read_text().splitlines()} if wav_scp.is_file() else {}
     utts = sorted(text)
 
     # Score the intersection only. An arm that dropped utterances to a degenerate sample would otherwise be
@@ -135,12 +143,16 @@ def main() -> None:
         print(f'per-arm wav counts {[(a, len(v)) for a, v in have.items()]}, '
               f'scoring the intersection: {len(keep)} utt')
         utts = sorted(keep)
+    if args.sample:
+        utts = [u for u in utts
+                if int(hashlib.md5(u.encode()).hexdigest()[:8], 16) % 1000 < int(args.sample * 1000)]
+        print(f'--sample {args.sample:.2f} -> {len(utts)} utt scored')
 
     model = Qwen3ASRModel.from_pretrained(args.asr_model, dtype=torch.bfloat16, device_map='cuda:0',
                                           max_inference_batch_size=args.batch, max_new_tokens=256)
 
     results, hyp_store = {}, {}
-    arms = [('real', [real[u] for u in utts])] + \
+    arms = ([('real', [real[u] for u in utts])] if real and all(u in real for u in utts) else []) + \
            [(a, [str(args.out_root / a / f'{u}.wav') for u in utts]) for a in args.arms]
     for name, paths in arms:
         hyp = transcribe(model, paths, args.batch)
@@ -152,7 +164,8 @@ def main() -> None:
         if mf.is_file():
             # restricted to the scored intersection so the duration number describes the same samples
             m = [x for x in json.loads(mf.read_text()) if x['utt'] in set(utts)]
-            dur = sum(x['synth_sec'] for x in m) / sum(x['real_sec'] for x in m)
+            secs = [x['real_sec'] for x in m]
+            dur = (sum(x['synth_sec'] for x in m) / sum(secs)) if secs and all(v is not None for v in secs) else None
         results[name] = {'err': {k: round(s[k], 4) for k in ('all', 'en', 'zh', 'num')},
                          'n_ref': {k: s[f'n_{k}'] for k in ('all', 'en', 'zh', 'num')},
                          'overall': round(s['overall'], 4), 'ins_per_ref': round(s['ins_per_ref'], 4),
@@ -164,12 +177,15 @@ def main() -> None:
               f"ins/ref {s['ins_per_ref'] * 100:5.2f}%"
               f"{'' if dur is None else f'   dur x{dur:.2f}'}")
 
-    floor = results['real']
-    print(f"\ngap over the real-audio floor ({floor['overall'] * 100:.2f}%):")
-    for a in args.arms:
-        print(f"  {a:10s} overall {(results[a]['overall'] - floor['overall']) * 100:+.2f}pp   "
-              f"en {(results[a]['err']['en'] - floor['err']['en']) * 100:+.2f}pp   "
-              f"zh {(results[a]['err']['zh'] - floor['err']['zh']) * 100:+.2f}pp")
+    if 'real' not in results:
+        print('\nno real-audio reference in this root: cross-arm comparison only, no floor to quote')
+    else:
+        floor = results['real']
+        print(f"\ngap over the real-audio floor ({floor['overall'] * 100:.2f}%):")
+        for a in args.arms:
+            print(f"  {a:10s} overall {(results[a]['overall'] - floor['overall']) * 100:+.2f}pp   "
+                  f"en {(results[a]['err']['en'] - floor['err']['en']) * 100:+.2f}pp   "
+                  f"zh {(results[a]['err']['zh'] - floor['err']['zh']) * 100:+.2f}pp")
 
     args.out_root.mkdir(parents=True, exist_ok=True)
     (args.out_root / 'asr_results.json').write_text(

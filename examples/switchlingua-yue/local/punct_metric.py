@@ -49,8 +49,10 @@ def main() -> None:
            for l in (args.data_root / args.split / 'text').read_text().splitlines()}
     store = json.loads(args.asr.read_text())
     # hypotheses are keyed by wav path; the utt id ends with the file stem in both sources
-    stem2utt = {Path(l.split(maxsplit=1)[1]).stem: l.split(maxsplit=1)[0]
-                for l in (args.data_root / args.split / 'wav.scp').read_text().splitlines()}
+    wav_scp = args.data_root / args.split / 'wav.scp'
+    stem2utt = ({Path(l.split(maxsplit=1)[1]).stem: l.split(maxsplit=1)[0]
+                 for l in wav_scp.read_text().splitlines()} if wav_scp.is_file()
+                else {u: u for u in ref})  # a generated corpus names its wavs <utt>.wav, so stem IS the utt
 
     print(f'{"arm":9s} {"utt":>4} ' + ' '.join(f'{w[:6]:>22s}' for w in WORDS) + '   total  strict  fuzzy')
     for arm, hyp_by_path in store['hyp'].items():
