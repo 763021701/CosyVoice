@@ -47,15 +47,16 @@ if [[ ! -d "${MODEL}" ]]; then
     echo "model dir not found: ${MODEL}" >&2
     exit 1
 fi
-# 用模型目录里的 fp32 ONNX 编 flow 引擎。TensorRT 10 会打开 FP16 builder flag。
+# 用模型目录里的 fp32 ONNX 编 flow 引擎，只开 TF32，不编 weakly-typed FP16。
 # 不设的话，vLLM-Omni 会先尝试下载 fp16 ONNX。
 if [[ -z "${COSYVOICE3_ESTIMATOR_ONNX:-}" && -f "${MODEL}/flow.decoder.estimator.fp32.onnx" ]]; then
     export COSYVOICE3_ESTIMATOR_ONNX="${MODEL}/flow.decoder.estimator.fp32.onnx"
 fi
 
-# 显存比例沿用官方 yaml：talker 0.4，code2wav 0.2。整段覆盖用 STAGE_OVERRIDES。
+# 显存比例沿用官方 yaml：talker 0.4，code2wav 0.2。code2wav 固定 fp32，
+# 避免 dtype=auto 落到 bf16 把波形打满。整段覆盖用 STAGE_OVERRIDES。
 if [[ -z "${STAGE_OVERRIDES:-}" ]]; then
-    STAGE_OVERRIDES="$(printf '{"0":{"max_num_seqs":%s,"gpu_memory_utilization":0.4},"1":{"max_num_seqs":%s,"gpu_memory_utilization":0.2}}' \
+    STAGE_OVERRIDES="$(printf '{"0":{"max_num_seqs":%s,"gpu_memory_utilization":0.4},"1":{"max_num_seqs":%s,"gpu_memory_utilization":0.2,"dtype":"float32"}}' \
         "${MAX_NUM_SEQS}" "${MAX_NUM_SEQS}")"
 fi
 
