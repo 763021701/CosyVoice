@@ -12,3 +12,6 @@ data_mix*/
 # libraries / pairs / plan jsons carry absolute paths into the private dataset. Repo-level rules only cover
 # `data/` and `*.wav`, so without this line `git add examples/switchlingua-yue/` would stage them.
 data_synth/
+# radiology synthesis (R5): same rule -- cell `text` is clinical report content and the manifests carry
+# absolute paths into the private dataset.
+data_radiology*/

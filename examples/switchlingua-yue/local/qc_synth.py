@@ -63,6 +63,21 @@ CTRL_MARGIN, CTRL_FRAC, CTRL_MED, CROSS_MAX = 0.05, 0.90, 0.15, 0.90
 # voiced speech per second of text, measured on this corpus: 800 random clips across the four cells give a
 # median of exactly 1.00 with this value
 VOICED_CPS = 16.5
+# CJK characters carry far more speech per character than Latin ones (三點二乘二點一 is 7 chars but ~1.3 s), so
+# a flat chars/16.5 expectation inflates vratio for CJK-dense sentences and widens the distribution enough to
+# break the 98% band on an otherwise healthy cell. Weighted expectation instead.
+CJK_CPS = 4.5
+
+
+def expected_sec(t: str) -> float:
+    cjk = sum(1 for ch in t if '一' <= ch <= '鿿')
+    return cjk / CJK_CPS + (len(t) - cjk) / VOICED_CPS
+
+
+# texts shorter than this get no vratio and no absolute minimum duration: for a 5-character control item
+# ("轉頭寫啦.") the formula predicts 0.3 s of speech, below what the model can physically emit, so the score is
+# a floor artefact rather than a defect. Measured on the radiology pilot, where exactly those rows failed.
+MIN_TEXT_FOR_RATIO = 25
 # The band is RELATIVE to each cell's own median, because the two arms sit at different absolute values:
 # vratio median 1.07/1.08 with SwitchLingua prompts (their clip length median 5.0 s) vs 0.90/0.92 with
 # pathology prompts (10.2 s). An absolute [0.6, 1.8] band therefore measures the arm's speaking density, not
@@ -139,6 +154,9 @@ def main() -> None:
     ap.add_argument('--no-voices', action='store_true', help='skip campplus: peak/duration/token gates only')
     ap.add_argument('--model-dir', type=Path, default=Path('data_mix_clean/ft_ep1'),
                     help='provides campplus.onnx and speech_tokenizer_v3.onnx')
+    ap.add_argument('--in-band-min', type=float, default=VR_IN_FRAC,
+                    help='share of clips that must sit inside the vratio band. A 60-clip pilot can only '
+                         'resolve 1/60 = 1.7%, so pilots are normally run with 0.95; the full corpus keeps 0.98')
     ap.add_argument('--threads', type=int, default=8)
     ap.add_argument('--repair-list', action='store_true',
                     help='print wavs that are unreadable, <1 s, or shorter than their header claims; deletes nothing')
@@ -148,6 +166,9 @@ def main() -> None:
     qd.mkdir(parents=True, exist_ok=True)
     libs = {k: [json.loads(l) for l in (args.root / f'libraries/{k}.library.jsonl').read_text().splitlines()]
             for k in ('slref', 'pathref')}
+    # optional: the radiology planner records how many library voices are actually reachable under its
+    # prompt-length cap (one slref item has a single 21.8 s clip), which is the right diversity expectation
+    plan = json.loads((args.root / 'plan.json').read_text()) if (args.root / 'plan.json').is_file() else {}
 
     # prompt-side embeddings: mostly already on disk from feature extraction; only the 102 hesitation clips
     # that training never used have to be computed once, then cached
@@ -219,7 +240,8 @@ def main() -> None:
                          # how much speech the clip actually contains, relative to what its text needs:
                          # catches both early-EOS truncation (<band) and letter-by-letter rambling (>band),
                          # neither of which peak/duration/dom_share can see
-                         'vratio': round(voiced / (len(text[u]) / VOICED_CPS), 3) if text.get(u) else None})
+                         'vratio': (round(voiced / expected_sec(text[u]), 3)
+                                    if text.get(u) and len(text[u]) >= MIN_TEXT_FOR_RATIO else None)})
         live = [r for r in rows if not r['unreadable']]
 
         if args.repair_list:
@@ -245,15 +267,25 @@ def main() -> None:
             cache = qd / f'{cell}.emb.pt'
             have = {}
             if cache.is_file():
-                have = {k: np.asarray(v, dtype=np.float32)
-                        for k, v in torch.load(cache, map_location='cpu', weights_only=True).items()}
+                # entries carry the (mtime, size) they were computed from: re-synthesising a clip keeps its
+                # utt id, so a cache keyed only by utt silently scores the OLD audio (measured: cos 0.21 vs
+                # the true 0.83 after a regeneration). Old-format entries are dropped and recomputed.
+                for k, v in torch.load(cache, map_location='cpu', weights_only=True).items():
+                    p = wdir / f'{k}.wav'
+                    if not p.is_file() or not isinstance(v, dict):
+                        continue
+                    st = p.stat()
+                    if v.get('sig') == [st.st_mtime_ns, st.st_size]:
+                        have[k] = np.asarray(v['vec'], dtype=np.float32)
             need = [r['utt'] for r in live if r['utt'] not in have]
             if need:
                 new = embed_paths([str(wdir / f'{u}.wav') for u in need],
                                   str(args.model_dir / 'campplus.onnx'), args.threads)
                 for u in need:
                     have[u] = np.asarray(new[str(wdir / f'{u}.wav')], dtype=np.float32)
-                torch.save({k: torch.from_numpy(v) for k, v in have.items()}, cache)
+                torch.save({k: {'sig': [(wdir / f'{k}.wav').stat().st_mtime_ns,
+                                        (wdir / f'{k}.wav').stat().st_size],
+                                'vec': torch.from_numpy(v)} for k, v in have.items()}, cache)
             libn = lib_emb[lib] / np.linalg.norm(lib_emb[lib], axis=1, keepdims=True)
             # paired control: the prompt dealt to the target half a rotation away in this cell. Dealing puts a
             # different speaker there, so cos(own prompt) - cos(control prompt) measures voice transfer without
@@ -263,8 +295,8 @@ def main() -> None:
             half = max(len(order) // 2, 1)
             vecs = []
             for r in live:
-                if r['utt'] not in have:
-                    continue
+                if r['utt'] not in have or len(text.get(r['utt'], '')) < MIN_TEXT_FOR_RATIO:
+                    continue    # <25 chars of audio cannot give a stable speaker embedding (measured: cos 0.06-0.44)
                 v = have[r['utt']]
                 vn = v / (np.linalg.norm(v) + 1e-9)
                 pu = pairs[r['utt']]['prompt_utt']
@@ -301,16 +333,23 @@ def main() -> None:
         voices_on = (lib in lib_emb) and not args.no_voices and bool(cos)
         # bool() everywhere: numpy scalars serialize as np.True_ and json.dumps then raises TypeError
         n_lib = len(libs[lib])
-        n_spk = len({r.get('item') or r.get('case') for r in libs[lib]})
+        # prefer the plan's reachable-voice count: a library voice whose only clip exceeds the prompt-length cap
+        # cannot be covered without breaking that cap (slref item 1830 is a single 21.8 s clip), so counting it
+        # in the expectation would fail a correct assignment
+        n_spk = plan.get('cells', {}).get(cell, {}).get('speakers_usable') or len(
+            {r.get('item') or r.get('case') for r in libs[lib]})
         gates = {
             'completeness': bool(g['have'] + len(failed) >= len(pairs)),
             'readable': bool(g['unreadable'] == 0),
-            'duration': bool(secs) and all(MIN_DUR <= s <= MAX_DUR for s in secs),
+            # the absolute floor only applies to texts long enough to expect >= MIN_DUR of speech
+            'duration': bool(secs) and all(
+                min(MIN_DUR, 0.7 * expected_sec(text.get(r['utt'], ''))) <= r['sec'] <= MAX_DUR
+                for r in live),
             'peak': bool(secs) and all(r['peak'] >= PEAK_MIN for r in live),
             'dominant_token': (all(d <= DOM_MAX for d in dom) if args.tokens != 'off' and dom else 'skipped'),
             # not "every clip inside the band" -- ~1.7% of healthy clips sit outside it by the control
             # measurement, so the gate is the share inside, and the outside ones go to defects.jsonl to redo
-            'content_ratio': bool(rel) and float(np.mean([VR_REL_LO <= x <= VR_REL_HI for x in rel])) >= VR_IN_FRAC,
+            'content_ratio': bool(rel) and float(np.mean([VR_REL_LO <= x <= VR_REL_HI for x in rel])) >= args.in_band_min,
             'voice_follow': (bool(np.median(cos) >= COS_MED_MIN
                                   and float(np.mean([c >= COS_OK for c in cos])) >= COS_OK_MIN
                                   and float(np.quantile(cos, 0.05)) >= COS_P05_MIN)) if voices_on else 'skipped',
@@ -318,8 +357,10 @@ def main() -> None:
                                and float(np.median(cdiff)) >= CTRL_MED) if voices_on else 'skipped',
             # the rotation covers the whole library once targets >= library, and every speaker as soon as the
             # dealt order has passed each group -- the bounds below are what that guarantee means exactly
-            'diversity': bool(len({v['prompt_utt'] for v in full.values()}) == min(n_lib, len(full))
-                              and len({v['prompt_speaker'] for v in full.values()}) == min(n_spk, len(full))),
+            # >= not ==: when targets outnumber the library every prompt is used and the assignment may reach a voice
+# whose only clip is above the length cap, so coverage can exceed the conservative `usable` expectation
+            'diversity': bool(len({v['prompt_utt'] for v in full.values()}) >= min(n_lib, len(full))
+                              and len({v['prompt_speaker'] for v in full.values()}) >= min(n_spk, len(full))),
             'no_voice_collapse': bool(cross < CROSS_MAX) if cross is not None else 'skipped',
         }
         q = lambda xs, p: float(np.quantile(xs, p)) if xs else None

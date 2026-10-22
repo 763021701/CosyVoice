@@ -60,6 +60,8 @@
 | `data_mix_clean/` | 4.4G | 清洗后 227/51/33，`wav.scp` 指向**本项目内的裁剪副本**，`clean_report.json` + 每 split 的 `silence_stats.jsonl`，R3 输出，`ft_ep0/` `ft_ep1/`（即用模型目录） |
 | `data_mix_xp/` | 15M | 单用途对照：清洗模型 + **未裁剪带长停顿的 prompt** |
 | `data_synth/` | 15G | R4 生成语料：`libraries/`（两臂库+指纹）、`corpus/{A,B}/`（快照+source_map）、`cells/<cell>{,_repair,_pilot}/`（4 格与返工/预演）、`synth/`（31,566 wav + manifest + 两把尺子的 hyp）、`qc/`（门禁表、逐条指标、返工存档） |
+| `data_radiology/` | 1.4G | R5：core_balanced 4,001 条（8.19 h）与 `cells/RAD_slref{,_pilot,_repair}`、`corpus/RAD/`、`qc/` |
+| `data_radiology_ext/` | 5.7G | R5：extended 独有 16,032 条（35.07 h）与 `cells/RADX_slref{,_pilot,_repair}`、`corpus/RADX/`、`qc/`（两目录合起来覆盖 20,033 个 id） |
 
 软链关系（删错会静默打断对照臂）：
 
@@ -405,5 +407,76 @@ A 侧两臂甚至互相矛盾 —— 这个量不能用随机抽样下结论。
 
 ---
 
-脚本清单：`local/{prepare_data,prepare_mix_data,clean_pathology,make_parquet,cosyvoice_train,eval_token,build_prompt_pairs,synth_test,asr_score,punct_metric,token_distance,fw_hyp,package_ft_model,make_synth_cells,qc_synth,make_repair_cells}.py`；`run.sh`（R1）、`run_mix.sh`（R2/R3，参数化）、`local/run_synth_cells.sh`（R4：smoke/pilot/full/status）。`exp/`、`data*/`、`data_synth/`、`*.pt` 均在 `.gitignore` 内，不会污染提交。
-（两个 R4 脚本叫 `make_*` 而不是 `build_*`：repo 级 `.gitignore:38` 的 `**/*build*` 会把它们当构建产物忽略掉。）
+## 10. R5：放射科报告语料（粤语数词口径，20,033 条）
+
+### 10.1 输入与覆盖
+
+| | 内容 |
+|---|---|
+| 语料 | `data/radiology/core_balanced.jsonl` **4,001** 条（md5 `f19b42a4…`）+ `extended.jsonl` **20,033** 条（md5 `30ea7747…`） |
+| 覆盖关系 | core 是 extended 的**严格子集**（4,001 个 id 与文本全部包含）⇒ 先合成 core，再合成 extended 独有的 **16,032** 条，两份产物合起来覆盖全部 20,033 个 id，不重复合成 |
+| 场景/类型 | 12 个 scene（cxr 500、chest_ct 501、brain_mri 502、spine_mri 502…）、6 个 text_type（natural_english 3,039 / template_english 527 / codeswitch 368 / control_english 43 / instruction 18 / instruction_english 6） |
+| 保留字段 | manifest 与 `source_map.jsonl` 保留 `split`（train/dev/test）、`group_id`、`scene`、`text_type`、`text_raw`、`text_tts`、`prompt_utt` —— 下游按 `group_id` 防泄漏 |
+
+### 10.2 朗读口径：数字与符号按粤语读，单位原样
+
+语料自身 CJK 全为港繁（21 个字：住佢係加句呢咁咗咯唔啊啦多好寫就翻跟轉返頭），无需转换。数字/符号按病理域训练口径改为港繁中文数词，**单位一字不动**（用户决定）：
+
+| 原文 | 送入 TTS | core 命中 | extended 独有命中 |
+|---|---|---|---|
+| `3.2 x 2.1 cm` | `三點二乘二點一 cm` | 188 | 446 |
+| `0.17` / `1.03` | `零點一七` / `一點零三` | 792（全部数字） | 2,763 |
+| `1-2 mm` / `8 to 17 mm` | `一至二 mm` / `八至十七 mm` | 23 + 1 | 85 |
+| `<4 mm` / `>5 mm` | `少於四 mm` / `大於五 mm` | 1 | — |
+| `86%` | `百分之八十六` | 4 | 46 |
+| `C5-6` / `L4/5` / `L5/S1` / `T12-L1` | `C五至六` / `L四至五` / `L五至S一` / `T十二至L一` | 166 | 533 |
+| `T1-weighted` / `T2/FLAIR` / `T2A` / `T1WI` | `T一 weighted` / `T二 FLAIR` / `T二 A` / `T一 W I` | 236 | 1,139 |
+| `03/11/2024`（DD/MM，用户确认） | `二零二四年十一月三日` | 50 | 127 |
+| `2022` / `2000 ml` | `二零二二` / `二千 ml`（年份逐位、量用自然读法） | 15 | 37 |
+| `7th rib` / `BI-RADS 1` | `第七 rib` / `BI-RADS 一` | 15 | 91 |
+
+边界与保留：`2903-255`（分机号）不被当成范围（范围规则限 ≤3 位数）；`23000→二萬三千`、`5696.90→五千六百九十六點九零`；英文拼写数词（`two`、`one`）保持英文；`o'clock`、`FLAIR`、`CT/MRI` 不变；行首 `— `/逗号、`,,`、整句引号、`Dr./approx.` 一并清理。
+
+**证据**：用三个解码器（基座 qwen3、域内微调 qwen3、whisper-yue）做 raw/词化对照与**孤立片段**探针。孤立片段里 `三點二乘二點一`、`百分之八十六`、`二零二四年四月四日`、`第六`、`C五至六`、`一至二 mm` 均被逐字认出 ⇒ CJK 数词可读；长英文句中的大量"数字错"是 ASR 对中文数词的上下文偏置（本域真实音频的 zh 错误率本就 76–99%），不作为 TTS 判据。
+
+**已知不一致（未改，按"单位原样"决定）**：`cm3`/`cc`/`cm/s` 共 8 条（core）+ 20 条（extended）会被逐字母念（"c m 三" / "c m m m"）；`T二 FLAIR` 读作 "T yi FLAIR"（粤语正确读法，但 ASR 常写作 "T E"）。
+
+### 10.3 产物与门禁
+
+| 根目录 | 条数 | 音频 | 体积 | 参考音库 |
+|---|---|---|---|---|
+| `data_radiology/`（core） | 4,001 | **8.19 h**（均 7.4 s） | 1.4 G | slref 7,272 条 / 10.61 h；**4,001 个目标各用唯一 prompt**，覆盖 1,700 位医生（第 1,701 位 `1830` 只有一条 21.8 s 片段，超过 12 s 上限） |
+| `data_radiology_ext/`（extended 独有） | 16,032 | **35.07 h**（均 7.9 s） | 5.7 G | 同样 slref；目标数 > 库容量 ⇒ **7,272 个 prompt 全部用满**（每个最多复用 3 次），覆盖 1,701 位 |
+| 合计 | **20,033** | **43.3 h** | 7.1 G | prompt 规则：`min(12 s, 1.5 × 预期目标时长)`，短控制项配 ≤2.5 s prompt |
+
+最终门禁（返工后重跑，七格全 PASS）：
+
+| cell | n | sec 中位 | peak_min | dom_share_max | cos 中位 | cos p05 | 对照差 | vratio 中位 | 带内 | 带外 |
+|---|---|---|---|---|---|---|---|---|---|---|
+| `RAD_slref`（core） | 4,001 | 6.28 | 0.013 | 0.161 | 0.805 | 0.684 | 0.525 | 1.012 | 0.998 | 7 |
+| `RADX_slref`（ext） | 16,032 | 6.88 | 0.012 | 0.262 | 0.808 | 0.695 | 0.529 | 1.037 | 0.998 | 36 |
+| R4 `A_slref` | 1,884 | 6.68 | 0.015 | 0.106 | 0.814 | 0.690 | 0.599 | 1.001 | 1.000 | 1 |
+| R4 `A_pathref` | 1,884 | 6.92 | 0.110 | 0.189 | 0.818 | 0.658 | 0.340 | 0.855 | 0.998 | 4 |
+| R4 `B_slref` | 13,899 | 9.48 | 0.017 | 0.202 | 0.820 | 0.714 | 0.551 | 1.054 | 1.000 | 6 |
+| R4 `B_pathref` | 13,899 | 9.32 | 0.088 | 0.299 | 0.827 | 0.665 | 0.345 | 0.908 | 0.999 | 15 |
+
+**返工**：首次 QC 后共点名 **438 条**（core 50 / extended 189 / R4 199）换同医生、≤12 s 的 prompt 重合成；旧音频先存档（各根的 `qc/pre_repair_backup/defect_wavs_round2.tar`），返工清单零缺件，带外条目 **438 → 69（0.22%）**。剩余 69 条列在各 `qc/<cell>.defects.jsonl`，可由使用方排除。
+
+### 10.4 量具变更（影响重跑口径）
+
+1. **CJK 感知的预期时长**：`expected = CJK/4.5 + 非CJK/16.5`，替代单一的"字符/16.5"。CJK 数字每个字承载的语音远多于拉丁字符，旧模型会让 CJK 密集句的 vratio 虚高（本批中位 1.13）。修正后 core 中位 1.012、ext 1.037；R4 的 vratio 中位也由 1.07/1.08（slref）与 0.90/0.92（pathref）更正为 **1.001/1.054** 与 **0.855/0.908**。
+2. **合成嵌入缓存加 `(mtime_ns, size)` 签名**：此前只按 utt 做键，重合成后 QC 仍读旧音频（实测 cos 0.21 vs 真实 0.83）。R4 返工的那 1,268 条逐条音色值此前是旧音频的，现已重算；**汇总 cos 中位基本不变**（0.815–0.827），说明旧缓存没有带偏中位数。
+3. **`diversity` 由 `==` 改 `>=`**：目标数超过库容量时全部 prompt 用满，覆盖可能多于保守的 `usable` 期望（本批 1,701 vs 1,700）。
+4. **pilot 可 `--in-band-min 0.95`**：60 条样本里 1 条即 1.7%，98% 在统计上不可达；全量仍用 0.98。
+5. **<25 字符文本不参与 vratio / 最短时长 / 音色门禁**：1 s 音频估不出音色（实测 cos 0.06–0.44），5 字符控制项的"预期 0.31 s"低于模型最短输出。
+
+### 10.5 交付与下游使用
+
+根目录 `data_radiology/` 与 `data_radiology_ext/`（均在 `.gitignore` 内）。使用时需要：`synth/<cell>/<id>.wav`、`synth/<cell>.manifest.json`（`real_sec` 恒为 null、`synth_sec` 为真实时长）、`cells/<cell>/text`（送入 TTS 的规范化文本）、`corpus/{RAD,RADX}/source_map.jsonl`（原始→规范化文本 + split/group/scene/type）、`plan.json`（输入 md5、规则计数、prompt 统计）、`qc/summary.json` + `qc/<cell>.qc.jsonl` + `qc/<cell>.defects.jsonl`。
+
+三条给 ASR 微调的硬警告：① 这是 **TTS 生成**音频，可以训练，但**评估/留出集必须仍是真实录音**，否则量到的是"ASR 认合成声音"的能力；② 中文数词在本域 ASR 上错误率极高（76–99%），做数字相关评估时要单独设计；③ 69 条带外条目与 `cm3/cm/s` 单位不一致条目在 `defects.jsonl` 与本节列明，是否排除由使用方决定。
+
+---
+
+脚本清单：`local/{prepare_data,prepare_mix_data,clean_pathology,make_parquet,cosyvoice_train,eval_token,build_prompt_pairs,synth_test,asr_score,punct_metric,token_distance,fw_hyp,package_ft_model,make_synth_cells,qc_synth,make_repair_cells,make_radiology_cells}.py`；`run.sh`（R1）、`run_mix.sh`（R2/R3，参数化）、`local/run_synth_cells.sh`（R4：smoke/pilot/full/status）。`exp/`、`data*/`、`data_synth/`、`data_radiology*/`、`*.pt` 均在 `.gitignore` 内，不会污染提交。
+（`make_*` 而不是 `build_*`：repo 级 `.gitignore:38` 的 `**/*build*` 会把它们当构建产物忽略掉。）
