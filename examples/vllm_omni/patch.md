@@ -267,3 +267,41 @@ STAGE_OVERRIDES="$(printf '{"0":{"max_num_seqs":%s,"gpu_memory_utilization":0.4}
 - 两个不同音色重叠：先发长句 A，约 1 秒后发短句 B。A 的说话人余弦贴近 A 的参考（复测 0.852），B 贴近 B（复测 0.917）。日志里不再出现 `keeping last tensor`。
 
 参考之间的说话人余弦大约 0.09 时，这个对比才分得开。同一条参考音的 batch 看不出问题 1。
+
+## 问题 3：并发时内容变差（批内顺序）
+
+2026-10-22 补（S2R，GOAL/O1）。改完问题 1、2 后，音色对了，但并发时内容明显变差：同样 100 条文本，评判 ASR 的错误在并发 16 时是 0.687，并发 1 时是 0.488，原来的 CosyVoice vLLM 路径是 0.450。时长也更长。
+
+原因：talker 用 FLASH_ATTN 后端，它不要求 vLLM 把解码行排在 prefill 前面，批内按常驻批的槽位顺序排。新请求补进空出的槽位，可能排在正在解码的请求前面。`embed_input_ids` 却按「解码在前」去切：从新请求的占位块一直取到下一个占位块，当作它的文本。于是别的请求正在解码的 token 被当成文本查了文本嵌入表；那些请求这一步的输入也被挤错，错的嵌入还留在它们的 KV cache 里。音色不受影响，内容出错。
+
+### 10. `worker/gpu_ar_model_runner.py`：把每行的范围先交给模型
+
+`execute_model` 里，在 `) = self._preprocess(scheduler_output, num_tokens_padded, intermediate_tensors)` 那段之前加：
+
+```python
+set_step_layout = getattr(self.model, "set_step_layout", None)
+if callable(set_step_layout):
+    set_step_layout(
+        num_scheduled_tokens=num_scheduled_tokens_np[:num_reqs],
+        num_computed_tokens=self.input_batch.num_computed_tokens_cpu[:num_reqs],
+    )
+```
+
+`prepare_runner_inputs` 在 `_preprocess` 之后才调用，来不及给 `embed_input_ids` 用，所以要单独在前面传。
+
+### 11. `model_executor/models/cosyvoice3/cosyvoice3.py`：按每行的范围重排
+
+- 加 `set_step_layout`：记下这一步每行（按批内顺序）的调度 token 数与已算 token 数，只用一次。
+- 加 `_embed_by_step_layout`：已算为 0、且以占位开头的行是新请求，在它自己的范围里把 `[SOS_ph, TASK_ph, AUDIO_ph * P, 文本]` 排成 `[SOS, 文本, TASK, 提示音]`；其余行按语音 token 嵌入。调度 token 数之和对不上、占位标记对不上或提示音条数对不上时返回 `None`。
+- `embed_input_ids` 的 talker 分支先调 `_embed_by_step_layout`，返回 `None` 才走原来的占位块切法，并 `warning_once`。
+
+### 12. 同一文件：静音 token 与 CosyVoice 对齐
+
+CosyVoice 的 `llm_job` 从连续第 6 个静音 token 起不再交给 flow（CosyVoice3 的静音 token：1, 2, 28, 29, 55, 248, 494, 2241, 2242, 2322, 2323）。code2wav 非流式分支里，`token_offset = ...` 之前加 `token = self._cut_silence(token)`。流式分支没动。
+
+重装后重打 10–12：S2R 仓库 `scripts/omni_patch_batch_layout.py`（在 cosyvoice_omni 环境里运行；打过就拒绝，原文件先备份）。
+
+### 怎么确认
+
+- 日志里没有 `no usable per-row layout` 的告警。
+- 同一批文本，并发 16 与并发 1 的评判 ASR 错误相近。2026-10-22 复测：并发 16 为 0.509（修复前 0.687），并发 1 为 0.488；平均时长 11.35 秒（修复前 12.81，CosyVoice 原路径 11.41）。
