@@ -37,6 +37,7 @@ _NO_SPACE_AFTER = frozenset("([{")
 
 _TOKEN_RE = re.compile(
     r"\[([A-Z0-9]+)\]"  # existing bracket phoneme chains
+    r"|(?:[#@])?[A-Za-z0-9]+(?:'[A-Za-z0-9]+)?(?:[.,][A-Za-z0-9]+)*"
     r"|[A-Za-z]+(?:'[A-Za-z]+)?"  # words with optional apostrophe
     r"|[^\s\w]"  # single punctuation / symbol
     r"|\s+",

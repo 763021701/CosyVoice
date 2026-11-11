@@ -167,6 +167,28 @@ pip install vllm==v0.11.0 transformers==4.57.1 numpy==1.26.4 -i https://mirrors.
 python vllm_example.py
 ```
 
+#### Blackwell / SM120 FlashInfer sampler
+
+On Blackwell SM120 GPUs, `VLLM_USE_FLASHINFER_SAMPLER=1` requires FlashInfer to
+compile for the detected GPU architecture. If PyTorch uses CUDA 13.x but the
+system toolkit selected by `nvcc` is CUDA 12.8, set the toolkit and architecture
+explicitly before starting Python:
+
+``` sh
+conda activate cosyvoice
+export CUDA_HOME=/usr/local/cuda-12.8
+export PATH=${CUDA_HOME}/bin:${PATH}
+export FLASHINFER_CUDA_ARCH_LIST=12.0a
+export VLLM_USE_FLASHINFER_SAMPLER=1
+python vllm_example.py
+```
+
+Use `12.0a` with CUDA 12.8. Do not use `12.0f` unless the selected CUDA toolkit
+is at least 12.9. With CUDA 12.9 or newer, prefer the matching toolkit and
+unset `FLASHINFER_CUDA_ARCH_LIST` so FlashInfer can detect the architecture
+automatically. Keep `flashinfer-python` and `flashinfer-cubin` on the same
+version.
+
 #### Start web demo
 
 You can use our web demo page to get familiar with CosyVoice quickly.

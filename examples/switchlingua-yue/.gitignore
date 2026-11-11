@@ -15,3 +15,4 @@ data_synth/
 # radiology synthesis (R5): same rule -- cell `text` is clinical report content and the manifests carry
 # absolute paths into the private dataset.
 data_radiology*/
+data_rad_moss*/

@@ -1,9 +1,4 @@
----
-description: 
-alwaysApply: true
----
-
-# Karpathy behavioral guidelines
+# AGENTS.md
 
 Behavioral guidelines to reduce common LLM coding mistakes. Merge with project-specific instructions as needed.
 
@@ -52,15 +47,15 @@ The test: Every changed line should trace directly to the user's request.
 **Define success criteria. Loop until verified.**
 
 Transform tasks into verifiable goals:
-- "Add validation" → "Write tests for invalid inputs, then make them pass"
-- "Fix the bug" → "Write a test that reproduces it, then make it pass"
-- "Refactor X" → "Ensure tests pass before and after"
+- "Add validation" -> "Write tests for invalid inputs, then make them pass"
+- "Fix the bug" -> "Write a test that reproduces it, then make it pass"
+- "Refactor X" -> "Ensure tests pass before and after"
 
 For multi-step tasks, state a brief plan:
 ```
-1. [Step] → verify: [check]
-2. [Step] → verify: [check]
-3. [Step] → verify: [check]
+1. [Step] -> verify: [check]
+2. [Step] -> verify: [check]
+3. [Step] -> verify: [check]
 ```
 
 Strong success criteria let you loop independently. Weak criteria ("make it work") require constant clarification.
@@ -68,3 +63,16 @@ Strong success criteria let you loop independently. Weak criteria ("make it work
 ---
 
 **These guidelines are working if:** fewer unnecessary changes in diffs, fewer rewrites due to overcomplication, and clarifying questions come before implementation rather than after mistakes.
+
+## Communication Style
+
+- Respond in Chinese by default, retaining English technical terminology.
+- Lead with the conclusion and answer directly without repeating the user's question.
+- Keep standard responses within 5–10 lines and final reports for complex tasks within 20 lines whenever possible.
+- After modifying code, report only: what changed, verification results, and unresolved issues.
+- Do not narrate individual tool calls, file reads, or routine execution steps.
+- Avoid lengthy logs, full diffs, or unnecessary code unless explicitly requested.
+- Avoid pleasantries, repetitive summaries, irrelevant suggestions, and decorative headings.
+- Maintain thorough reasoning, implementation, testing, and code review; only minimize user-facing communication.
+- Clearly report errors, risks, test failures, and uncertainties. Never omit critical information for the sake of brevity.
+- When the user explicitly requests a detailed explanation, the above length limits do not apply.

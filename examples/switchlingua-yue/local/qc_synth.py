@@ -332,7 +332,8 @@ def main() -> None:
              'out_of_band': len(defects)}
         voices_on = (lib in lib_emb) and not args.no_voices and bool(cos)
         # bool() everywhere: numpy scalars serialize as np.True_ and json.dumps then raises TypeError
-        n_lib = len(libs[lib])
+        # prompts reachable under the planner's length cap, when it recorded one (pathref: 433 of 660 <= 12 s)
+        n_lib = plan.get('cells', {}).get(cell, {}).get('prompts_usable') or len(libs[lib])
         # prefer the plan's reachable-voice count: a library voice whose only clip exceeds the prompt-length cap
         # cannot be covered without breaking that cap (slref item 1830 is a single 21.8 s clip), so counting it
         # in the expectation would fail a correct assignment

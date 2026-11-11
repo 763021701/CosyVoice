@@ -247,6 +247,9 @@ def main() -> None:
     ap.add_argument('--input', type=Path, default=REPO / 'data/radiology/core_balanced.jsonl')
     ap.add_argument('--out', type=Path, default=Path('data_radiology'))
     ap.add_argument('--library', type=Path, default=Path('data_synth/libraries/slref.library.jsonl'))
+    ap.add_argument('--library-name', default='slref',
+                    help='voice-library name used in the cell name (<tag>_<name>) and in qc/repair, which pick '
+                         'the library back by splitting the cell name; must match libraries/<name>.library.jsonl')
     ap.add_argument('--tag', default='RAD', help='cell/corpus name prefix: <tag>_slref')
     ap.add_argument('--exclude-ids-from', type=Path,
                     help='jsonl whose ids are already covered elsewhere (extended.jsonl is a strict '
@@ -254,6 +257,11 @@ def main() -> None:
     ap.add_argument('--pilot', type=int, default=60)
     ap.add_argument('--cps', type=float, default=16.0, help='characters per second of generated speech, measured')
     ap.add_argument('--max-prompt-sec', type=float, default=12.0)
+    ap.add_argument('--strict-prompt-cap', action='store_true',
+                    help='never exceed --max-prompt-sec: reuse short prompts instead. Needed when targets '
+                         'outnumber the library (pathref has 433 clips <=12 s for 4,001 targets); without it '
+                         'the assignment falls back to long prompts, and R4 measured >=20 s prompts losing '
+                         'content 43% of the time')
     ap.add_argument('--dry-run', action='store_true')
     args = ap.parse_args()
 
@@ -306,8 +314,12 @@ def main() -> None:
 
     # prompt assignment: dealt rotation over the SL library, but never feed a prompt much longer than the
     # target (the model warns and degrades when the prompt text dominates); expected duration ~ chars / cps
-    pairs, used, order = {}, Counter(), deal(lib, 'item')
+    # SL rows carry `item`, pathology rows carry `case`; the cell name carries the library name so both work
+    spk_key = 'item' if lib and 'item' in lib[0] else 'case'
+    pairs, used, order = {}, Counter(), deal(lib, spk_key)
     assigned, covered, ptr = set(), set(), 0
+    cap_pool = [q for q in order if q['dur'] <= args.max_prompt_sec]   # safe fallback when strict
+    reuse_ptr = 0
     spk = lambda p: p.get('item') or p.get('case')       # noqa: E731
     for r in sorted(rows, key=lambda x: x['utt']):
         cap = min(args.max_prompt_sec, max(2.5, 1.5 * len(r['text']) / args.cps))
@@ -324,22 +336,26 @@ def main() -> None:
                 fallback = (q, (ptr + k + 1) % len(order))
         if chosen is None and fallback:
             chosen, ptr = fallback
-        if chosen is None:                   # nothing unused under the cap: accept a longer prompt
+        if chosen is None and not args.strict_prompt_cap:   # accept a longer prompt only when not strict
             for k in range(len(order)):
                 q = order[(ptr + k) % len(order)]
                 if q['utt'] not in assigned:
                     chosen, ptr = q, (ptr + k + 1) % len(order)
                     break
-        if chosen is None:                   # more targets than library entries: reuse from the dealt order
-            chosen = order[ptr % len(order)]
-            ptr += 1
+        if chosen is None:                   # more targets than usable prompts: reuse the short pool
+            if args.strict_prompt_cap and cap_pool:
+                chosen = cap_pool[reuse_ptr % len(cap_pool)]
+                reuse_ptr += 1
+            else:
+                chosen = order[ptr % len(order)]
+                ptr += 1
         assigned.add(chosen['utt'])
         covered.add(spk(chosen))
         used[chosen['utt']] += 1
         p = chosen
         pairs[r['utt']] = {'prompt_utt': p['utt'], 'prompt_wav': p['wav'], 'prompt_text': p['text'],
-                           'same_item': False, 'cos': None, 'fallback': False, 'library': 'slref',
-                           'prompt_speaker': p.get('item'), 'prompt_dur': p['dur']}
+                           'same_item': False, 'cos': None, 'fallback': False, 'library': args.library_name,
+                           'prompt_speaker': p.get('item') or p.get('case'), 'prompt_dur': p['dur']}
 
     # coverage repair: 4,001 picks over 7,272 clips can leave a voice untouched (measured: 1,700 of 1,701).
     # Hand each missing voice to one of the longest targets -- their cap is the loosest -- keeping prompts distinct.
@@ -361,7 +377,7 @@ def main() -> None:
         used[q['utt']] += 1
         repaired += 1
     print(f'coverage repair: {repaired} target(s) re-pointed, {len(covered)} voices covered')
-    cell = f'{args.tag}_slref'
+    cell = f'{args.tag}_{args.library_name}'
     (args.out / 'cells' / cell).mkdir(parents=True, exist_ok=True)
     (args.out / 'cells' / cell / 'text').write_text('\n'.join(f"{r['utt']} {r['text']}" for r in rows) + '\n')
     (args.out / 'cells' / f'{cell}_prompt_pairs.json').write_text(
@@ -393,10 +409,12 @@ def main() -> None:
 
     dur_of = {p['utt']: p['dur'] for p in lib}
     plan = dict(report, cells={cell: {'n': len(rows), 'n_pilot': len(pilot),
-                                      'n_prompts': len(used), 'speakers': len(covered),
+                                      'n_prompts': len(used), 'prompts_usable': len(cap_pool),
+                                      'speakers': len(covered),
                                       # voices that actually have a clip under the length cap; one library item
                                       # (1830) has a single 21.8 s clip, so 1,700 of 1,701 are reachable
-                                      'speakers_usable': len({r['item'] for r in lib if r['dur'] <= args.max_prompt_sec}),
+                                      'speakers_usable': len({r.get('item') or r.get('case') for r in lib
+                                                           if r['dur'] <= args.max_prompt_sec}),
                                       'prompt_reuse_max': max(used.values()),
                                       'prompt_dur_median': sorted(dur_of[u] for u in used)[len(used) // 2]}},
                 pilot_overlap={k: sum(1 for r in pilot if pred(r)) for k, (pred, _) in want.items()})
