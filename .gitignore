@@ -41,6 +41,9 @@ tensorboard
 .cache
 compile_commands.json
 
+# Codegraph local index
+.codegraph/
+
 # train/inference files
 *.wav
 *.m4a

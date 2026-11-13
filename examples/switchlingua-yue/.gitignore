@@ -16,3 +16,6 @@ data_synth/
 # absolute paths into the private dataset.
 data_radiology*/
 data_rad_moss*/
+# continuation fine-tune parquet: text plus audio bytes of the paired utterances
+data_continuation/
+data_pathcont/
